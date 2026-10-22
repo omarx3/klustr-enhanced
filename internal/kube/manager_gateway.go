@@ -1,0 +1,163 @@
+package kube
+
+import "fmt"
+
+func (m *ClientManager) Gateways(contextName, namespace string) []GatewayInfo {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return []GatewayInfo{}
+	}
+	return listAcrossNamespaces(namespace, w.Gateways)
+}
+
+func (m *ClientManager) Gateway(contextName, namespace, name string) (*GatewayDetail, error) {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return nil, fmt.Errorf("no active watch for context %q", contextName)
+	}
+	return w.Gateway(namespace, name)
+}
+
+func (m *ClientManager) HTTPRoutes(contextName, namespace string) []HTTPRouteInfo {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return []HTTPRouteInfo{}
+	}
+	return listAcrossNamespaces(namespace, w.HTTPRoutes)
+}
+
+func (m *ClientManager) HTTPRoute(contextName, namespace, name string) (*HTTPRouteDetail, error) {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return nil, fmt.Errorf("no active watch for context %q", contextName)
+	}
+	return w.HTTPRoute(namespace, name)
+}
+
+func (m *ClientManager) GRPCRoutes(contextName, namespace string) []GRPCRouteInfo {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return []GRPCRouteInfo{}
+	}
+	return listAcrossNamespaces(namespace, w.GRPCRoutes)
+}
+
+func (m *ClientManager) GRPCRoute(contextName, namespace, name string) (*GRPCRouteDetail, error) {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return nil, fmt.Errorf("no active watch for context %q", contextName)
+	}
+	return w.GRPCRoute(namespace, name)
+}
+
+func (m *ClientManager) GatewayClasses(contextName string) []GatewayClassInfo {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return []GatewayClassInfo{}
+	}
+	return w.GatewayClasses()
+}
+
+func (m *ClientManager) GatewayClass(contextName, name string) (*GatewayClassDetail, error) {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return nil, fmt.Errorf("no active watch for context %q", contextName)
+	}
+	return w.GatewayClass(name)
+}
+
+func (m *ClientManager) ReferenceGrants(contextName, namespace string) []ReferenceGrantInfo {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return []ReferenceGrantInfo{}
+	}
+	return listAcrossNamespaces(namespace, w.ReferenceGrants)
+}
+
+func (m *ClientManager) ReferenceGrant(contextName, namespace, name string) (*ReferenceGrantDetail, error) {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return nil, fmt.Errorf("no active watch for context %q", contextName)
+	}
+	return w.ReferenceGrant(namespace, name)
+}
+
+func (m *ClientManager) TLSRoutes(contextName, namespace string) []TLSRouteInfo {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return []TLSRouteInfo{}
+	}
+	return listAcrossNamespaces(namespace, w.TLSRoutes)
+}
+
+func (m *ClientManager) TLSRoute(contextName, namespace, name string) (*TLSRouteDetail, error) {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return nil, fmt.Errorf("no active watch for context %q", contextName)
+	}
+	return w.TLSRoute(namespace, name)
+}
+
+func (m *ClientManager) TCPRoutes(contextName, namespace string) []TCPRouteInfo {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return []TCPRouteInfo{}
+	}
+	return listAcrossNamespaces(namespace, w.TCPRoutes)
+}
+
+func (m *ClientManager) TCPRoute(contextName, namespace, name string) (*TCPRouteDetail, error) {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return nil, fmt.Errorf("no active watch for context %q", contextName)
+	}
+	return w.TCPRoute(namespace, name)
+}
+
+func (m *ClientManager) UDPRoutes(contextName, namespace string) []UDPRouteInfo {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return []UDPRouteInfo{}
+	}
+	return listAcrossNamespaces(namespace, w.UDPRoutes)
+}
+
+func (m *ClientManager) UDPRoute(contextName, namespace, name string) (*UDPRouteDetail, error) {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return nil, fmt.Errorf("no active watch for context %q", contextName)
+	}
+	return w.UDPRoute(namespace, name)
+}
+
+func (m *ClientManager) ListenerSets(contextName, namespace string) []ListenerSetInfo {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return []ListenerSetInfo{}
+	}
+	return listAcrossNamespaces(namespace, w.ListenerSets)
+}
+
+func (m *ClientManager) ListenerSet(contextName, namespace, name string) (*ListenerSetDetail, error) {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return nil, fmt.Errorf("no active watch for context %q", contextName)
+	}
+	return w.ListenerSet(namespace, name)
+}
+
+func (m *ClientManager) BackendTLSPolicies(contextName, namespace string) []BackendTLSPolicyInfo {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return []BackendTLSPolicyInfo{}
+	}
+	return listAcrossNamespaces(namespace, w.BackendTLSPolicies)
+}
+
+func (m *ClientManager) BackendTLSPolicy(contextName, namespace, name string) (*BackendTLSPolicyDetail, error) {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return nil, fmt.Errorf("no active watch for context %q", contextName)
+	}
+	return w.BackendTLSPolicy(namespace, name)
+}

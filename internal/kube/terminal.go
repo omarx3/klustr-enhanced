@@ -1,0 +1,428 @@
+package kube
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"runtime"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+)
+
+type TerminalDataFunc func(data string)
+type TerminalCloseFunc func(err error)
+
+// ptyProcess is a child on a Unix pty or a Windows ConPTY.
+// Close and Kill are both safe to call more than once.
+type ptyProcess interface {
+	io.ReadWriteCloser
+	Resize(cols, rows uint16) error
+	Wait() error
+	Kill() error
+}
+
+type terminalSession struct {
+	id         string
+	context    string
+	proc       ptyProcess
+	cancel     context.CancelFunc
+	kubeconfig string
+	// kubeconfigLock holds the kubeconfig open for the session. Go opens
+	// files without FILE_SHARE_DELETE, so on Windows another klustr
+	// instance's SweepStaleLaunchFiles can't delete it under a live tab.
+	kubeconfigLock *os.File
+	once           sync.Once
+}
+
+func (s *terminalSession) close() {
+	s.once.Do(func() {
+		s.cancel()
+		if s.proc != nil {
+			_ = s.proc.Close()
+			_ = s.proc.Kill()
+		}
+		if s.kubeconfigLock != nil {
+			_ = s.kubeconfigLock.Close()
+		}
+		if s.kubeconfig != "" {
+			_ = os.Remove(s.kubeconfig)
+		}
+	})
+}
+
+type terminalSessionManager struct {
+	mu       sync.Mutex
+	sessions map[string]*terminalSession
+	counter  uint64
+}
+
+func newTerminalSessionManager() *terminalSessionManager {
+	return &terminalSessionManager{sessions: make(map[string]*terminalSession)}
+}
+
+// start spawns a host login shell with KUBECONFIG pointing at a minified
+// single-context copy of the user's kubeconfig. The shell inherits the
+// user's existing environment so PATH-resolved kubectl, helm, stern, etc.
+// talk to the right cluster without any further interactive setup.
+func (mgr *terminalSessionManager) start(
+	parent context.Context,
+	rules *clientcmd.ClientConfigLoadingRules,
+	contextName string,
+	cols, rows uint16,
+	onData TerminalDataFunc,
+	onClose TerminalCloseFunc,
+) (string, error) {
+	if contextName == "" {
+		return "", fmt.Errorf("context name is required")
+	}
+
+	kubeconfigPath, err := writeContextKubeconfig(rules, contextName)
+	if err != nil {
+		return "", err
+	}
+
+	ctx, cancel := context.WithCancel(parent)
+	shell, args := terminalShell()
+	env := terminalEnv(os.Environ(), kubeconfigPath, contextName, defaultUTF8Locale())
+	var dir string
+	if home, err := os.UserHomeDir(); err == nil {
+		dir = home
+	}
+	if cols == 0 {
+		cols = 80
+	}
+	if rows == 0 {
+		rows = 24
+	}
+
+	proc, err := startPTY(ctx, shell, args, env, dir, cols, rows)
+	if err != nil {
+		cancel()
+		_ = os.Remove(kubeconfigPath)
+		return "", err
+	}
+
+	id := fmt.Sprintf("term-%d", atomic.AddUint64(&mgr.counter, 1))
+	lock, _ := os.Open(kubeconfigPath)
+	sess := &terminalSession{
+		id:             id,
+		context:        contextName,
+		proc:           proc,
+		cancel:         cancel,
+		kubeconfig:     kubeconfigPath,
+		kubeconfigLock: lock,
+	}
+
+	mgr.mu.Lock()
+	mgr.sessions[id] = sess
+	mgr.mu.Unlock()
+
+	go func() {
+		// Coalesce PTY output before the bridge: emitting per 4KB read floods
+		// the main thread with EventsEmit dispatches on a firehose (cat, yes,
+		// tail), the same jank exec.go avoids. close() flushes the tail.
+		out := newByteCoalescer(onData)
+		buf := make([]byte, 4096)
+		for {
+			n, err := proc.Read(buf)
+			if n > 0 {
+				_, _ = out.Write(buf[:n])
+			}
+			if err != nil {
+				break
+			}
+		}
+		out.close()
+		waitErr := proc.Wait()
+		mgr.mu.Lock()
+		delete(mgr.sessions, id)
+		mgr.mu.Unlock()
+		sess.close()
+		if onClose != nil {
+			// A shell that ran and exited — even with a non-zero status
+			// (exit 1, or Ctrl-D after a failed command) — is a clean close,
+			// not a session error. Only surface a real spawn/IO failure.
+			var exitErr *exec.ExitError
+			clean := waitErr == nil || errors.Is(waitErr, io.EOF) ||
+				errors.Is(ctx.Err(), context.Canceled) || errors.As(waitErr, &exitErr)
+			if clean {
+				onClose(nil)
+			} else {
+				onClose(waitErr)
+			}
+		}
+	}()
+
+	return id, nil
+}
+
+func (mgr *terminalSessionManager) sendInput(id, data string) {
+	mgr.mu.Lock()
+	sess := mgr.sessions[id]
+	mgr.mu.Unlock()
+	if sess == nil {
+		return
+	}
+	_, _ = sess.proc.Write([]byte(data))
+}
+
+func (mgr *terminalSessionManager) resize(id string, cols, rows uint16) {
+	mgr.mu.Lock()
+	sess := mgr.sessions[id]
+	mgr.mu.Unlock()
+	if sess == nil {
+		return
+	}
+	_ = sess.proc.Resize(cols, rows)
+}
+
+func (mgr *terminalSessionManager) stop(id string) {
+	mgr.mu.Lock()
+	sess, ok := mgr.sessions[id]
+	if ok {
+		delete(mgr.sessions, id)
+	}
+	mgr.mu.Unlock()
+	if ok {
+		sess.close()
+	}
+}
+
+// stopForContext kills every local shell bound to a context, called from
+// StopWatch so a disconnect tears down its terminals (each holds a minified
+// kubeconfig for that context) instead of leaving them live.
+func (mgr *terminalSessionManager) stopForContext(contextName string) {
+	mgr.mu.Lock()
+	var stopped []*terminalSession
+	for id, s := range mgr.sessions {
+		if s.context == contextName {
+			stopped = append(stopped, s)
+			delete(mgr.sessions, id)
+		}
+	}
+	mgr.mu.Unlock()
+	for _, s := range stopped {
+		s.close()
+	}
+}
+
+func (mgr *terminalSessionManager) stopAll() {
+	mgr.mu.Lock()
+	sessions := make([]*terminalSession, 0, len(mgr.sessions))
+	for _, s := range mgr.sessions {
+		sessions = append(sessions, s)
+	}
+	mgr.sessions = make(map[string]*terminalSession)
+	mgr.mu.Unlock()
+	for _, s := range sessions {
+		s.close()
+	}
+}
+
+// terminalEnv fills in what a GUI-launched app lacks because it has no
+// controlling terminal, without overriding anything the user exported.
+// Without TERM, zsh's line editor can't resolve terminfo and echoes every
+// keystroke several times; without a UTF-8 locale, prompt glyphs garble. An
+// empty locale (none confirmed on this host) leaves the locale untouched.
+func terminalEnv(base []string, kubeconfigPath, contextName, locale string) []string {
+	env := contextEnv(base, kubeconfigPath, contextName)
+	if !hasEnvKey(env, "TERM") {
+		env = append(env, "TERM=xterm-256color")
+	}
+	if !hasEnvKey(env, "COLORTERM") {
+		env = append(env, "COLORTERM=truecolor")
+	}
+	if locale != "" && !hasEnvKey(env, "LANG") && !hasEnvKey(env, "LC_ALL") && !hasEnvKey(env, "LC_CTYPE") {
+		env = append(env, "LANG="+locale)
+	}
+	return env
+}
+
+// contextEnv points a shell, in-app or external, at one context.
+func contextEnv(base []string, kubeconfigPath, contextName string) []string {
+	env := append([]string{}, base...)
+	env = append(env,
+		"KUBECONFIG="+kubeconfigPath,
+		"KLUSTR_CONTEXT="+contextName,
+		// Hint for users with PS1 logic that wants to surface the cluster.
+		"KUBE_CONTEXT="+contextName,
+	)
+	if runtime.GOOS == "windows" {
+		// wsl.exe forwards a variable only when WSLENV names it.
+		env = append(env, "WSLENV="+wslEnvShared(env))
+	}
+	return env
+}
+
+// wslSharedVars are the WSLENV entries for contextEnv's variables. /p
+// rewrites the kubeconfig's Win32 path into its /mnt form.
+var wslSharedVars = []string{"KUBECONFIG/p", "KLUSTR_CONTEXT", "KUBE_CONTEXT"}
+
+// wslEnvShared returns env's WSLENV with wslSharedVars in it. WSLENV names
+// are case-sensitive, so only exact names are replaced. A user's own
+// KUBECONFIG entry goes too: its flags were picked for their value, and this
+// one is always a single Win32 path, which needs /p.
+func wslEnvShared(env []string) string {
+	var existing string
+	for _, e := range env {
+		name, v, ok := strings.Cut(e, "=")
+		if ok && strings.EqualFold(name, "WSLENV") {
+			existing = v
+		}
+	}
+	parts := []string{}
+	for part := range strings.SplitSeq(existing, ":") {
+		if part != "" && !isWSLSharedVar(part) {
+			parts = append(parts, part)
+		}
+	}
+	return strings.Join(append(parts, wslSharedVars...), ":")
+}
+
+func isWSLSharedVar(entry string) bool {
+	name, _, _ := strings.Cut(entry, "/")
+	for _, v := range wslSharedVars {
+		if shared, _, _ := strings.Cut(v, "/"); shared == name {
+			return true
+		}
+	}
+	return false
+}
+
+// defaultUTF8Locale returns a UTF-8 locale that `locale -a` confirms exists,
+// preferring C.UTF-8 over en_US.UTF-8, or "". Exporting a locale that was
+// never generated triggers setlocale warnings on Linux. Names are compared
+// ignoring case and dashes because Linux reports en_US.utf8 / C.utf8.
+func defaultUTF8Locale() string {
+	if runtime.GOOS == "windows" {
+		return ""
+	}
+	out, err := exec.Command("locale", "-a").Output()
+	if err != nil {
+		if runtime.GOOS == "darwin" {
+			return "en_US.UTF-8"
+		}
+		return ""
+	}
+	available := make(map[string]bool)
+	for line := range strings.SplitSeq(string(out), "\n") {
+		if norm := normalizeLocale(line); norm != "" {
+			available[norm] = true
+		}
+	}
+	for _, want := range []string{"C.UTF-8", "en_US.UTF-8"} {
+		if available[normalizeLocale(want)] {
+			return want
+		}
+	}
+	return ""
+}
+
+func normalizeLocale(s string) string {
+	return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(s), "-", ""))
+}
+
+// hasEnvKey matches names case-insensitively on Windows, where Term and
+// TERM are the same variable.
+func hasEnvKey(env []string, key string) bool {
+	for _, e := range env {
+		name, _, _ := strings.Cut(e, "=")
+		if name == key || (runtime.GOOS == "windows" && strings.EqualFold(name, key)) {
+			return true
+		}
+	}
+	return false
+}
+
+func terminalShell() (string, []string) {
+	if runtime.GOOS == "windows" {
+		return windowsShell(os.Getenv, exec.LookPath)
+	}
+	shell := userShell()
+	return shell, loginShellArgs(shell)
+}
+
+// windowsShell passes -NoLogo to PowerShell to keep the banner out of a tab
+// that already shows the context. SHELL only wins when it resolves: Cygwin,
+// WSL interop and Emacs setups export POSIX paths CreateProcess can't start.
+func windowsShell(getenv func(string) string, lookPath func(string) (string, error)) (string, []string) {
+	if s := getenv("SHELL"); s != "" {
+		if path, err := lookPath(s); err == nil {
+			return path, loginShellArgs(path)
+		}
+	}
+	for _, name := range []string{"pwsh.exe", "powershell.exe"} {
+		if path, err := lookPath(name); err == nil {
+			return path, []string{"-NoLogo"}
+		}
+	}
+	if s := getenv("COMSPEC"); s != "" {
+		return s, nil
+	}
+	return "cmd.exe", nil
+}
+
+func userShell() string {
+	if s := os.Getenv("SHELL"); s != "" {
+		return s
+	}
+	if runtime.GOOS == "darwin" {
+		return "/bin/zsh"
+	}
+	return "/bin/bash"
+}
+
+// loginShellArgs picks the right "behave like a login shell" flag so the
+// user's normal rc files (.zshrc / .bashrc / .profile) are sourced and
+// prompts, aliases and shell functions look like a regular Terminal tab.
+func loginShellArgs(shell string) []string {
+	name := strings.TrimSuffix(strings.ToLower(shell), ".exe")
+	switch {
+	case strings.HasSuffix(name, "zsh"), strings.HasSuffix(name, "bash"):
+		return []string{"-l"}
+	default:
+		return nil
+	}
+}
+
+// writeContextKubeconfig writes a 0600 temp kubeconfig holding only the named
+// context, its cluster and user. The shell gets it via KUBECONFIG, so its
+// tools target that cluster without the tab touching the real kubeconfig's
+// current-context.
+func writeContextKubeconfig(rules *clientcmd.ClientConfigLoadingRules, contextName string) (string, error) {
+	raw, err := rules.Load()
+	if err != nil {
+		return "", err
+	}
+	if _, ok := raw.Contexts[contextName]; !ok {
+		return "", fmt.Errorf("context %q not found", contextName)
+	}
+	cfg := raw.DeepCopy()
+	cfg.CurrentContext = contextName
+	if err := clientcmdapi.MinifyConfig(cfg); err != nil {
+		return "", err
+	}
+
+	f, err := os.CreateTemp("", "klustr-kubeconfig-*.yaml")
+	if err != nil {
+		return "", err
+	}
+	path := f.Name()
+	_ = f.Close()
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	if err := clientcmd.WriteToFile(*cfg, path); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	return path, nil
+}

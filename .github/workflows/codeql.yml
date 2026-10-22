@@ -1,0 +1,78 @@
+name: CodeQL
+
+on:
+  # Same docs-only set as the changes job in ci.yml. CodeQL is not a required
+  # check, so a workflow-level filter can't leave a PR unmergeable here.
+  push:
+    branches: ["main"]
+    paths-ignore: ["**.md", "docs/**", ".github/ISSUE_TEMPLATE/**"]
+  pull_request:
+    branches: ["main"]
+    paths-ignore: ["**.md", "docs/**", ".github/ISSUE_TEMPLATE/**"]
+  schedule:
+    - cron: "23 6 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze ${{ matrix.language }}
+    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    # Match release.yml: webkit 4.1 needs the webkit2_41 build tag so CodeQL's
+    # autobuild of the Go module links against the right headers.
+    env:
+      GOFLAGS: -tags=webkit2_41
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: go
+            build-mode: autobuild
+          - language: javascript-typescript
+            build-mode: none
+          # Analyses the workflows themselves — the dataflow query behind
+          # actions/code-injection is what catches an expression reaching a
+          # run: block. The extractor's paths are fixed and cover
+          # .github/workflows plus any action.yml in the tree.
+          - language: actions
+            build-mode: none
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        if: matrix.language == 'go'
+        with:
+          go-version-file: go.mod
+
+      - uses: ./.github/actions/linux-build-deps
+        if: matrix.language == 'go'
+
+      - name: Stub embedded frontend assets
+        if: matrix.language == 'go'
+        run: mkdir -p frontend/dist && touch frontend/dist/index.html
+
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          queries: security-and-quality
+          config: |
+            paths-ignore:
+              - frontend/src/lib/wails/**
+              - frontend/dist/**
+              - frontend/node_modules/**
+              - build/**
+
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"

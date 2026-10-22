@@ -1,0 +1,32 @@
+# Maintainer: Samet Kum <kumsamet@gmail.com>
+pkgname=klustr-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="Native Kubernetes desktop client — multi-context cluster management with live updates, logs, exec, port-forward, RBAC, CRDs, Helm, Argo CD and Gateway API support"
+arch=('x86_64')
+url="https://github.com/SametKUM/klustr"
+license=('Apache-2.0')
+depends=('webkit2gtk-4.1' 'gtk3')
+provides=('klustr')
+conflicts=('klustr')
+# Every local filename carries ${pkgver}: makepkg reuses any same-named file
+# already in the build directory instead of re-downloading it, so an unversioned
+# name serves a stale icon from an older release and fails the checksum.
+source=("klustr-v${pkgver}-linux-amd64.tar.gz::${url}/releases/download/v${pkgver}/klustr-v${pkgver}-linux-amd64.tar.gz"
+        "klustr-${pkgver}.desktop::${url}/raw/v${pkgver}/build/linux/klustr.desktop"
+        "klustr-${pkgver}.png::${url}/raw/v${pkgver}/build/appicon.png"
+        "klustr-${pkgver}.svg::${url}/raw/v${pkgver}/build/appicon.svg")
+sha256sums=('@SHA_TARBALL@'
+            '@SHA_DESKTOP@'
+            '@SHA_PNG@'
+            '@SHA_SVG@')
+
+package() {
+  install -Dm755 "${srcdir}/klustr" "${pkgdir}/usr/bin/klustr"
+  install -Dm644 "${srcdir}/klustr-${pkgver}.desktop" "${pkgdir}/usr/share/applications/klustr.desktop"
+  install -Dm644 "${srcdir}/klustr-${pkgver}.png" "${pkgdir}/usr/share/icons/hicolor/512x512/apps/klustr.png"
+  install -Dm644 "${srcdir}/klustr-${pkgver}.svg" "${pkgdir}/usr/share/icons/hicolor/scalable/apps/klustr.svg"
+  # Arch's licenses package already ships the Apache-2.0 text; only the NOTICE
+  # is specific to this project.
+  install -Dm644 "${srcdir}/NOTICE" "${pkgdir}/usr/share/licenses/${pkgname}/NOTICE"
+}

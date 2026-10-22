@@ -1,0 +1,115 @@
+package kube
+
+import "fmt"
+
+func (m *ClientManager) ServiceAccounts(contextName, namespace string) []ServiceAccountInfo {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return []ServiceAccountInfo{}
+	}
+	return listAcrossNamespaces(namespace, w.ServiceAccounts)
+}
+
+func (m *ClientManager) ServiceAccount(contextName, namespace, name string) (*ServiceAccountDetail, error) {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return nil, fmt.Errorf("no active watch for context %q", contextName)
+	}
+	return w.ServiceAccount(namespace, name)
+}
+
+func (m *ClientManager) Roles(contextName, namespace string) []RoleInfo {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return []RoleInfo{}
+	}
+	return listAcrossNamespaces(namespace, w.Roles)
+}
+
+func (m *ClientManager) Role(contextName, namespace, name string) (*RoleDetail, error) {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return nil, fmt.Errorf("no active watch for context %q", contextName)
+	}
+	return w.Role(namespace, name)
+}
+
+func (m *ClientManager) RoleBindings(contextName, namespace string) []RoleBindingInfo {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return []RoleBindingInfo{}
+	}
+	return listAcrossNamespaces(namespace, w.RoleBindings)
+}
+
+func (m *ClientManager) RoleBinding(contextName, namespace, name string) (*RoleBindingDetail, error) {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return nil, fmt.Errorf("no active watch for context %q", contextName)
+	}
+	return w.RoleBinding(namespace, name)
+}
+
+func (m *ClientManager) ClusterRoles(contextName string) []ClusterRoleInfo {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return []ClusterRoleInfo{}
+	}
+	return w.ClusterRoles()
+}
+
+func (m *ClientManager) ClusterRole(contextName, name string) (*ClusterRoleDetail, error) {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return nil, fmt.Errorf("no active watch for context %q", contextName)
+	}
+	return w.ClusterRole(name)
+}
+
+func (m *ClientManager) ClusterRoleBindings(contextName string) []ClusterRoleBindingInfo {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return []ClusterRoleBindingInfo{}
+	}
+	return w.ClusterRoleBindings()
+}
+
+func (m *ClientManager) ClusterRoleBinding(contextName, name string) (*ClusterRoleBindingDetail, error) {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return nil, fmt.Errorf("no active watch for context %q", contextName)
+	}
+	return w.ClusterRoleBinding(name)
+}
+
+func (m *ClientManager) CertificateSigningRequests(contextName string) []CertificateSigningRequestInfo {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return []CertificateSigningRequestInfo{}
+	}
+	return w.CertificateSigningRequests()
+}
+
+func (m *ClientManager) CertificateSigningRequest(contextName, name string) (*CertificateSigningRequestDetail, error) {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return nil, fmt.Errorf("no active watch for context %q", contextName)
+	}
+	return w.CertificateSigningRequest(name)
+}
+
+func (m *ClientManager) AccessSubjects(contextName string) []AccessSubject {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return []AccessSubject{}
+	}
+	return w.ListAccessSubjects()
+}
+
+func (m *ClientManager) SubjectAccess(contextName, kind, namespace, name string) (*SubjectAccess, error) {
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return nil, fmt.Errorf("no active watch for context %q", contextName)
+	}
+	return w.GetSubjectAccess(AccessSubject{Kind: kind, Namespace: namespace, Name: name}), nil
+}

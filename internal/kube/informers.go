@@ -1,0 +1,697 @@
+package kube
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/dynamic/dynamicinformer"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/metadata"
+	"k8s.io/client-go/tools/cache"
+
+	gwclient "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
+	gwinformers "sigs.k8s.io/gateway-api/pkg/client/informers/externalversions"
+)
+
+const debounceWindow = 100 * time.Millisecond
+
+// OwnerRef is the trimmed shape of an OwnerReference embedded in Info/Detail
+// payloads. We never need the full UID/Controller fields on the client.
+type OwnerRef struct {
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+}
+
+// controllerOwnerRef returns the controlling OwnerReference (Controller=true)
+// trimmed to OwnerRef, or nil when none of the refs is a controller.
+func controllerOwnerRef(refs []metav1.OwnerReference) *OwnerRef {
+	for _, o := range refs {
+		if o.Controller != nil && *o.Controller {
+			return &OwnerRef{Kind: o.Kind, Name: o.Name}
+		}
+	}
+	return nil
+}
+
+type ChangeFunc func(kind string, delta *KindDelta)
+
+// pendingItem is the latest net op buffered for one (namespace/name) key within
+// a debounce window; info is the projected struct for an upsert, nil for a remove.
+type pendingItem struct {
+	op   DeltaOp
+	info any
+}
+
+// pendingKind buffers one kind's churn within a window. touched marks an event
+// that can't be described incrementally (no projector, unprojectable tombstone,
+// post-sync/denied touch) ⇒ the flushed delta is a Reset (full refetch).
+type pendingKind struct {
+	items   map[string]pendingItem
+	touched bool
+}
+
+// contextWatcher owns one context's informers. The access map routes each kind
+// to the all-namespaces `factory` or the namespaced `scoped` fallback, so a
+// namespace-restricted user gets live data instead of a 403ing cluster-wide
+// LIST that leaves the cache silently empty.
+type contextWatcher struct {
+	factory        informers.SharedInformerFactory // cluster-wide; nil when user has no cluster-wide list at all
+	scoped         informers.SharedInformerFactory // namespaced fallback; nil when no kind needs it
+	access         *contextAccess                  // per-kind routing decisions; nil ⇒ assume cluster-wide
+	defaultNS      string                          // kubeconfig context.namespace, used as the scoped probe target
+	cs             kubernetes.Interface            // kept around for SelfSubjectAccessReview
+	disco          discovery.DiscoveryInterface    // timeout-bounded; used for construction-time probes
+	gwFactory      gwinformers.SharedInformerFactory
+	gwScoped       gwinformers.SharedInformerFactory
+	gwVersions     map[string]string
+	gwAccess       *contextAccess
+	gwMu           sync.RWMutex
+	gwPending      map[string]bool
+	gwStarted      map[string]bool
+	apiSvcFactory  dynamicinformer.DynamicSharedInformerFactory
+	apiSvcInformer cache.SharedIndexInformer
+	dyn            dynamic.Interface
+	meta           metadata.Interface
+	crd            *crdWatcher
+	helm           *helmWatch
+	onChange       ChangeFunc
+	cancel         context.CancelFunc
+	stopCh         <-chan struct{}
+
+	startMu  sync.Mutex
+	bindings map[string]kindBinding
+	started  map[string]bool
+
+	mu      sync.Mutex
+	pending map[string]*pendingKind
+	gen     map[string]uint64 // per-kind monotonic delta generation
+	timer   *time.Timer
+	stopped bool
+}
+
+func newContextWatcher(cs *kubernetes.Clientset, disco discovery.DiscoveryInterface, gw gwclient.Interface, dyn dynamic.Interface, meta metadata.Interface, defaultNS string, onChange ChangeFunc) *contextWatcher {
+	w := &contextWatcher{
+		cs:        cs,
+		disco:     disco,
+		dyn:       dyn,
+		meta:      meta,
+		defaultNS: defaultNS,
+		onChange:  onChange,
+		pending:   make(map[string]*pendingKind),
+		gen:       make(map[string]uint64),
+	}
+	w.helm = newHelmWatch(w)
+	if gw != nil {
+		w.gwFactory = gwinformers.NewSharedInformerFactory(gw, 0)
+		if defaultNS != "" {
+			w.gwScoped = gwinformers.NewSharedInformerFactoryWithOptions(gw, 0, gwinformers.WithNamespace(defaultNS))
+		}
+		w.gwVersions, w.gwPending = discoverGatewayVersions(context.Background(), disco)
+	}
+	return w
+}
+
+// factoryFor returns the informer factory that owns kind, or nil when the user
+// has no access. It is also the lazy-start chokepoint: a kind's informer only
+// starts, and pays its LIST, when something first asks for it.
+func (w *contextWatcher) factoryFor(kind string) informers.SharedInformerFactory {
+	w.ensureKind(kind)
+	return w.routedFactory(kind)
+}
+
+func (w *contextWatcher) routedFactory(kind string) informers.SharedInformerFactory {
+	if w.access == nil {
+		return w.factory
+	}
+	switch w.access.For(kind).Mode {
+	case AccessCluster:
+		return w.factory
+	case AccessNamespaced:
+		return w.scoped
+	default:
+		return nil
+	}
+}
+
+// ensureKind registers and starts a kind's informer on first request, then
+// touches the kind once its cache syncs so the frontend's synced gate flips.
+func (w *contextWatcher) ensureKind(kind string) {
+	w.startMu.Lock()
+	defer w.startMu.Unlock()
+	if w.started == nil || w.started[kind] {
+		return
+	}
+	w.started[kind] = true
+	b, ok := w.bindings[kind]
+	if !ok {
+		return
+	}
+	f := w.routedFactory(kind)
+	if f == nil {
+		// Denied kinds get no informer; an immediate touch flips the
+		// frontend's synced flag so the empty list shows without waiting
+		// for the skeleton grace timer.
+		w.touch(kind)
+		return
+	}
+	informer := b.pick(f)
+	if b.indexers != nil {
+		// Precedes Start (AddIndexers rejects a running informer); the informer
+		// is freshly registered here so it can't be running yet. A failure is
+		// non-fatal — PodsOnNode falls back to a full scan without the index.
+		_ = informer.AddIndexers(b.indexers)
+	}
+	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj any) { w.handleInformerEvent(informer, kind, b, DeltaUpsert, obj) },
+		UpdateFunc: func(_, obj any) { w.handleInformerEvent(informer, kind, b, DeltaUpsert, obj) },
+		DeleteFunc: func(obj any) { w.handleInformerEvent(informer, kind, b, DeltaRemove, obj) },
+	})
+	if err != nil {
+		return
+	}
+	// Start only spins up informers not yet running, so repeated calls per
+	// lazily-added kind are safe.
+	f.Start(w.stopCh)
+	go func() {
+		if cache.WaitForCacheSync(w.stopCh, informer.HasSynced) {
+			w.touch(kind)
+		}
+	}()
+}
+
+// handleInformerEvent drops events until the informer's initial LIST syncs:
+// client-go replays the whole cache as Adds first, and shipping them as
+// upserts ahead of the post-sync touch's full refetch would double the attach
+// payload. The post-sync touch is the authoritative first load.
+func (w *contextWatcher) handleInformerEvent(informer cache.SharedIndexInformer, kind string, b kindBinding, op DeltaOp, obj any) {
+	if !informer.HasSynced() {
+		return
+	}
+	w.record(kind, b, op, obj)
+}
+
+func (w *contextWatcher) start(parent context.Context) error {
+	ctx, cancel := context.WithCancel(parent)
+	w.cancel = cancel
+
+	// A credential-refresh rewatch pre-seeds w.access from the prior watcher:
+	// token rotation keeps the same identity, so the RBAC surface is unchanged
+	// and re-running ~50 SSAR probes (~8s) would only reconfirm it.
+	if w.access == nil {
+		w.access = discoverAccess(ctx, w.cs, w.disco, w.defaultNS)
+	}
+	if w.access.HasAnyClusterWide() {
+		w.factory = informers.NewSharedInformerFactoryWithOptions(
+			w.cs.(*kubernetes.Clientset), 0,
+			informers.WithTransform(stripManagedFields),
+		)
+	}
+	if scopedNS := w.access.ScopedNamespace(); scopedNS != "" {
+		w.scoped = informers.NewSharedInformerFactoryWithOptions(
+			w.cs.(*kubernetes.Clientset), 0,
+			informers.WithNamespace(scopedNS),
+			informers.WithTransform(stripManagedFields),
+		)
+	}
+
+	w.crd = newCRDWatcher(w.dyn, ctx.Done(), w.touch, func(gvr schema.GroupVersionResource) bool {
+		return canListRetry(ctx, w.cs, gvr)
+	})
+	// Skip the cluster-wide CRD watcher when the user can't list CRDs —
+	// otherwise client-go's reflector retries on a tight loop and floods
+	// the log with 403s. Retry once on a probe error so a transient hiccup
+	// doesn't blank the CRD sidebar and every CRD-gated integration.
+	if canListRetry(ctx, w.cs, crdGVR) {
+		if err := w.crd.start(); err != nil {
+			cancel()
+			return err
+		}
+		go w.warmKEDA(ctx)
+	}
+
+	w.stopCh = ctx.Done()
+	w.bindings = kindBindings()
+	w.started = make(map[string]bool)
+
+	if err := w.startGatewayInformers(ctx); err != nil {
+		cancel()
+		return err
+	}
+
+	if err := w.startAPIServiceInformer(ctx); err != nil {
+		cancel()
+		return err
+	}
+
+	// Only the namespace selector and the default pods view start eagerly;
+	// every other kind starts on first use.
+	w.ensureKind("Namespace")
+	w.ensureKind("Pod")
+
+	go cleanupStaleNodeShellPods(ctx, w.cs)
+	return nil
+}
+
+// kindBinding describes how to obtain a kind's informer from its routed
+// factory.
+type kindBinding struct {
+	pick     func(informers.SharedInformerFactory) cache.SharedIndexInformer
+	indexers cache.Indexers
+
+	// project turns a cached object into its frontend Info struct plus a
+	// "namespace/name" key, for the delta-update protocol. nil ⇒ the kind's
+	// handler degrades to a bare touch (a Reset delta).
+	project func(obj any) (key string, info any, ok bool)
+}
+
+// projector builds a kindBinding.project from a single-object Info constructor,
+// so a kind wires delta support in one line: project: projector(xInfoFrom).
+// Cluster-scoped kinds get an empty namespace, so their key is "/name" — the
+// same shape the frontend keys by.
+func projector[T metav1.Object, I any](from func(T) I) func(obj any) (string, any, bool) {
+	return func(obj any) (string, any, bool) {
+		t, ok := obj.(T)
+		if !ok {
+			return "", nil, false
+		}
+		return t.GetNamespace() + "/" + t.GetName(), from(t), true
+	}
+}
+
+// kindBindings is the auditable routing table mapping every covered kind to
+// its informer constructor. Registration and start happen lazily per kind in
+// ensureKind; this table only declares what exists.
+func kindBindings() map[string]kindBinding {
+	type binding struct {
+		kind     string
+		informer func(informers.SharedInformerFactory) cache.SharedIndexInformer
+	}
+	bindings := []binding{
+		{"Pod", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Core().V1().Pods().Informer()
+		}},
+		{"Namespace", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Core().V1().Namespaces().Informer()
+		}},
+		{"Deployment", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Apps().V1().Deployments().Informer()
+		}},
+		{"Service", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Core().V1().Services().Informer()
+		}},
+		{"ConfigMap", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Core().V1().ConfigMaps().Informer()
+		}},
+		{"Secret", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Core().V1().Secrets().Informer()
+		}},
+		{"StatefulSet", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Apps().V1().StatefulSets().Informer()
+		}},
+		{"DaemonSet", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Apps().V1().DaemonSets().Informer()
+		}},
+		{"Job", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Batch().V1().Jobs().Informer()
+		}},
+		{"CronJob", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Batch().V1().CronJobs().Informer()
+		}},
+		{"ReplicationController", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Core().V1().ReplicationControllers().Informer()
+		}},
+		{"Endpoints", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Core().V1().Endpoints().Informer()
+		}},
+		{"ValidatingWebhookConfiguration", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Admissionregistration().V1().ValidatingWebhookConfigurations().Informer()
+		}},
+		{"MutatingWebhookConfiguration", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Admissionregistration().V1().MutatingWebhookConfigurations().Informer()
+		}},
+		{"Lease", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Coordination().V1().Leases().Informer()
+		}},
+		{"RuntimeClass", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Node().V1().RuntimeClasses().Informer()
+		}},
+		{"PriorityClass", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Scheduling().V1().PriorityClasses().Informer()
+		}},
+		{"IngressClass", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Networking().V1().IngressClasses().Informer()
+		}},
+		{"LimitRange", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Core().V1().LimitRanges().Informer()
+		}},
+		{"ResourceQuota", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Core().V1().ResourceQuotas().Informer()
+		}},
+		{"EndpointSlice", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Discovery().V1().EndpointSlices().Informer()
+		}},
+		{"PodDisruptionBudget", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Policy().V1().PodDisruptionBudgets().Informer()
+		}},
+		{"HorizontalPodAutoscaler", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Autoscaling().V2().HorizontalPodAutoscalers().Informer()
+		}},
+		{"NetworkPolicy", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Networking().V1().NetworkPolicies().Informer()
+		}},
+		{"StorageClass", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Storage().V1().StorageClasses().Informer()
+		}},
+		{"PersistentVolume", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Core().V1().PersistentVolumes().Informer()
+		}},
+		{"PersistentVolumeClaim", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Core().V1().PersistentVolumeClaims().Informer()
+		}},
+		{"ReplicaSet", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Apps().V1().ReplicaSets().Informer()
+		}},
+		{"Ingress", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Networking().V1().Ingresses().Informer()
+		}},
+		{"Node", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Core().V1().Nodes().Informer()
+		}},
+		{"ServiceAccount", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Core().V1().ServiceAccounts().Informer()
+		}},
+		{"Role", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Rbac().V1().Roles().Informer()
+		}},
+		{"RoleBinding", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Rbac().V1().RoleBindings().Informer()
+		}},
+		{"ClusterRole", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Rbac().V1().ClusterRoles().Informer()
+		}},
+		{"ClusterRoleBinding", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Rbac().V1().ClusterRoleBindings().Informer()
+		}},
+		{"CertificateSigningRequest", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Certificates().V1().CertificateSigningRequests().Informer()
+		}},
+		{"CSIDriver", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Storage().V1().CSIDrivers().Informer()
+		}},
+		{"CSINode", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Storage().V1().CSINodes().Informer()
+		}},
+		{"VolumeAttachment", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Storage().V1().VolumeAttachments().Informer()
+		}},
+		{"FlowSchema", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Flowcontrol().V1().FlowSchemas().Informer()
+		}},
+		{"PriorityLevelConfiguration", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Flowcontrol().V1().PriorityLevelConfigurations().Informer()
+		}},
+		{"ValidatingAdmissionPolicy", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Admissionregistration().V1().ValidatingAdmissionPolicies().Informer()
+		}},
+		{"ValidatingAdmissionPolicyBinding", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Admissionregistration().V1().ValidatingAdmissionPolicyBindings().Informer()
+		}},
+		{"MutatingAdmissionPolicy", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Admissionregistration().V1().MutatingAdmissionPolicies().Informer()
+		}},
+		{"MutatingAdmissionPolicyBinding", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Admissionregistration().V1().MutatingAdmissionPolicyBindings().Informer()
+		}},
+		{"DeviceClass", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Resource().V1().DeviceClasses().Informer()
+		}},
+		{"ResourceClaim", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Resource().V1().ResourceClaims().Informer()
+		}},
+		{"ResourceClaimTemplate", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Resource().V1().ResourceClaimTemplates().Informer()
+		}},
+		{"ResourceSlice", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Resource().V1().ResourceSlices().Informer()
+		}},
+		{"ServiceCIDR", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Networking().V1().ServiceCIDRs().Informer()
+		}},
+		{"IPAddress", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Networking().V1().IPAddresses().Informer()
+		}},
+	}
+
+	out := make(map[string]kindBinding, len(bindings))
+	for _, b := range bindings {
+		out[b.kind] = kindBinding{pick: b.informer}
+	}
+
+	// Pod carries a by-node index so node detail resolves its pods without
+	// scanning the whole pod cache, plus a projector so it is the delta-update
+	// pilot kind.
+	if pod, ok := out["Pod"]; ok {
+		pod.indexers = podIndexers
+		pod.project = projectPod
+		out["Pod"] = pod
+	}
+
+	// Delta-update projectors for the high-churn / high-count kinds. Low-
+	// cardinality kinds (cluster-scoped singletons, RBAC, admission, …) stay on
+	// the full-refetch path: a delta there is churn without payoff.
+	setProject := func(kind string, p func(obj any) (string, any, bool)) {
+		if b, ok := out[kind]; ok {
+			b.project = p
+			out[kind] = b
+		}
+	}
+	setProject("Deployment", projector(deploymentInfoFrom))
+	setProject("StatefulSet", projector(statefulSetInfoFrom))
+	setProject("DaemonSet", projector(daemonSetInfoFrom))
+	setProject("ReplicaSet", projector(replicaSetInfoFrom))
+	setProject("ReplicationController", projector(replicationControllerInfoFrom))
+	setProject("Job", projector(jobInfoFrom))
+	setProject("CronJob", projector(cronJobInfoFrom))
+	setProject("ConfigMap", projector(configMapInfoFrom))
+	setProject("Service", projector(serviceInfoFrom))
+	setProject("Endpoints", projector(endpointsInfoFrom))
+	setProject("EndpointSlice", projector(endpointSliceInfoFrom))
+	setProject("Ingress", projector(ingressInfoFrom))
+	setProject("NetworkPolicy", projector(networkPolicyInfoFrom))
+	setProject("Node", projector(nodeInfo))
+	setProject("Lease", projector(leaseInfoFrom))
+	setProject("Secret", projector(secretInfoFrom))
+	return out
+}
+
+// errKindNoAccess is the canonical error returned by Get methods when the
+// caller's RBAC doesn't include the kind. Returned to the frontend so the
+// UI can show "Forbidden" instead of a generic load failure.
+func errKindNoAccess(kind string) error {
+	return fmt.Errorf("no list/watch access for %s in this context", kind)
+}
+
+func (w *contextWatcher) stop() {
+	if w.cancel != nil {
+		w.cancel()
+	}
+	w.mu.Lock()
+	w.stopped = true
+	if w.timer != nil {
+		w.timer.Stop()
+		w.timer = nil
+	}
+	w.pending = make(map[string]*pendingKind)
+	w.mu.Unlock()
+}
+
+// pendingKindLocked returns (creating if needed) the buffer for a kind. Caller
+// must hold w.mu.
+func (w *contextWatcher) pendingKindLocked(kind string) *pendingKind {
+	pk := w.pending[kind]
+	if pk == nil {
+		pk = &pendingKind{items: make(map[string]pendingItem)}
+		w.pending[kind] = pk
+	}
+	return pk
+}
+
+// armTimerLocked starts the debounce timer if it isn't already running. Caller
+// must hold w.mu.
+func (w *contextWatcher) armTimerLocked() {
+	if w.timer == nil {
+		w.timer = time.AfterFunc(debounceWindow, w.flush)
+	}
+}
+
+// touch marks a kind as changed in a way that can't be described incrementally
+// (post-sync, denied kind, CRD/Gateway events). The flushed delta is a Reset, so
+// the frontend refetches — exactly the pre-delta behavior. Keeps the func(string)
+// shape so existing callbacks (crdWatcher) wire in unchanged.
+func (w *contextWatcher) touch(kind string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stopped {
+		return
+	}
+	w.pendingKindLocked(kind).touched = true
+	w.armTimerLocked()
+}
+
+// record buffers a single informer event as a net delta op. The projection runs
+// here, on the informer goroutine, while the cache object is valid; only the
+// projected struct + key cross into the buffer. Kinds without a projector, and
+// unprojectable tombstones, degrade to touch (a Reset/refetch).
+func (w *contextWatcher) record(kind string, b kindBinding, op DeltaOp, obj any) {
+	if b.project == nil {
+		w.touch(kind)
+		return
+	}
+	if op == DeltaRemove {
+		if tomb, isTomb := obj.(cache.DeletedFinalStateUnknown); isTomb {
+			obj = tomb.Obj
+		}
+		// A remove keeps only the key, so derive it cheaply — every projector's
+		// key is "namespace/name". Running the full project() here would build
+		// (and immediately discard) the whole Info struct on the delete hot path,
+		// which for high-churn kinds (Jobs, ReplicaSets, evicted Pods) is pure
+		// wasted CPU/allocation on the informer goroutine.
+		acc, err := meta.Accessor(obj)
+		if err != nil {
+			w.touch(kind)
+			return
+		}
+		key := acc.GetNamespace() + "/" + acc.GetName()
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		if w.stopped {
+			return
+		}
+		// A remove supersedes a prior upsert (a born-and-died key flushes as a
+		// remove, which the frontend no-ops when the key is absent).
+		w.pendingKindLocked(kind).items[key] = pendingItem{op: DeltaRemove}
+		w.armTimerLocked()
+		return
+	}
+	key, info, ok := b.project(obj)
+	if !ok {
+		w.touch(kind)
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stopped {
+		return
+	}
+	// Latest op wins: an upsert carries the freshest projection and supersedes a
+	// prior remove buffered for the same key.
+	w.pendingKindLocked(kind).items[key] = pendingItem{op: DeltaUpsert, info: info}
+	w.armTimerLocked()
+}
+
+func (w *contextWatcher) flush() {
+	w.mu.Lock()
+	// A timer that already fired can run flush after stop(); don't emit change
+	// events for a detached context.
+	if w.stopped {
+		w.mu.Unlock()
+		return
+	}
+	pending := w.pending
+	w.pending = make(map[string]*pendingKind)
+	w.timer = nil
+	cb := w.onChange
+	deltas := make(map[string]*KindDelta, len(pending))
+	for kind, pk := range pending {
+		w.gen[kind]++
+		g := w.gen[kind]
+		// touched supersedes any buffered items: if part of the window couldn't be
+		// described incrementally, refetch the whole kind.
+		if pk.touched {
+			deltas[kind] = &KindDelta{Gen: g, Reset: true}
+			continue
+		}
+		d := &KindDelta{Gen: g, Upserts: []any{}, Removed: []string{}}
+		for key, it := range pk.items {
+			if it.op == DeltaRemove {
+				d.Removed = append(d.Removed, key)
+			} else {
+				d.Upserts = append(d.Upserts, it.info)
+			}
+		}
+		deltas[kind] = d
+	}
+	w.mu.Unlock()
+
+	if cb == nil {
+		return
+	}
+	for kind, d := range deltas {
+		cb(kind, d)
+	}
+}
+
+// sortByNamespaceName sorts an arbitrary slice in place by (namespace, name)
+// using a supplied accessor. Cluster-scoped Info types use plain sort.Slice
+// on Name directly instead of this generic helper.
+func sortByNamespaceName[T any](slice []T, key func(int) (string, string)) {
+	sort.Slice(slice, func(i, j int) bool {
+		ni, n := key(i)
+		nj, m := key(j)
+		if ni != nj {
+			return ni < nj
+		}
+		return n < m
+	})
+}
+
+// toInt64 coerces a dynamic-client JSON number (which deserializes as float64,
+// int64 or int depending on path) to int64. Zero for any other type.
+func toInt64(v any) int64 {
+	switch n := v.(type) {
+	case int64:
+		return n
+	case float64:
+		return int64(n)
+	case int:
+		return int64(n)
+	}
+	return 0
+}
+
+func formatLabelSelector(sel *metav1.LabelSelector) string {
+	if sel == nil || (len(sel.MatchLabels) == 0 && len(sel.MatchExpressions) == 0) {
+		return "<all>"
+	}
+	parts := make([]string, 0, len(sel.MatchLabels)+len(sel.MatchExpressions))
+	for k, v := range sel.MatchLabels {
+		parts = append(parts, k+"="+v)
+	}
+	sort.Strings(parts)
+	for _, m := range sel.MatchExpressions {
+		parts = append(parts, fmt.Sprintf("%s %s %v", m.Key, m.Operator, m.Values))
+	}
+	return strings.Join(parts, ",")
+}
+
+func formatNodeSelector(sel map[string]string) string {
+	if len(sel) == 0 {
+		return "<none>"
+	}
+	parts := make([]string, 0, len(sel))
+	for k, v := range sel {
+		parts = append(parts, k+"="+v)
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
+}

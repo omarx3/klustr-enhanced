@@ -1,0 +1,500 @@
+package kube
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"testing/synctest"
+	"time"
+)
+
+type fakeProvider struct {
+	name     string
+	captures atomic.Int32
+	mu       sync.Mutex
+	cred     CapturedCredentials
+	err      error
+	block    chan struct{}
+}
+
+func (f *fakeProvider) Name() string                    { return f.name }
+func (f *fakeProvider) Detect() bool                    { return true }
+func (f *fakeProvider) ListProfiles() ([]string, error) { return []string{"p1"}, nil }
+func (f *fakeProvider) Capture(ctx context.Context, profile string) (CapturedCredentials, error) {
+	f.captures.Add(1)
+	if f.block != nil {
+		select {
+		case <-f.block:
+		case <-ctx.Done():
+			return CapturedCredentials{}, ctx.Err()
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cred, f.err
+}
+
+func (f *fakeProvider) set(cred CapturedCredentials, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cred = cred
+	f.err = err
+}
+
+// setMapping/clearMapping marshal the store outside the lock, so the clone
+// must be taken under the lock — otherwise a concurrent mutation triggers the
+// "concurrent map iteration and map write" runtime fatal. Run with -race.
+func TestMappingWritesAreConcurrencySafe(t *testing.T) {
+	p := &fakeProvider{name: "fake"}
+	c := testCredManager(t, p)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ctx := fmt.Sprintf("ctx%d", i)
+			for j := 0; j < 200; j++ {
+				_ = c.setMapping(ctx, CredentialMapping{Provider: "fake", Profile: "p1"})
+				_ = c.clearMapping(ctx)
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestScheduleRefreshSkippedWhilePaused(t *testing.T) {
+	c := testCredManager(t, &fakeProvider{name: "fake"})
+	c.pauseRefresh("ctx1")
+	c.scheduleRefresh("ctx1", time.Now().Add(time.Hour))
+	c.mu.Lock()
+	_, armed := c.timers["ctx1"]
+	c.mu.Unlock()
+	if armed {
+		t.Error("scheduleRefresh armed a timer for a paused (disconnected) context")
+	}
+}
+
+func TestRefreshBailsWhilePaused(t *testing.T) {
+	p := &fakeProvider{name: "fake"}
+	p.set(validCred(), nil)
+	c := testCredManager(t, p)
+	if err := c.setMapping("ctx1", CredentialMapping{Provider: "fake", Profile: "p1"}); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	c.onRefreshed = func(string) { called = true }
+	c.pauseRefresh("ctx1")
+	c.refresh("ctx1")
+	if called {
+		t.Error("refresh re-captured / notified for a paused context")
+	}
+}
+
+func TestEnsureFreshReconnectRestoresRefresh(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		expiring bool
+	}{
+		{name: "expiring credentials", expiring: true},
+		{name: "non-expiring credentials"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &fakeProvider{name: "fake"}
+			cred := validCred()
+			if !tc.expiring {
+				cred.expiry = time.Time{}
+			}
+			p.set(cred, nil)
+			c := testCredManager(t, p)
+			t.Cleanup(c.stopAll)
+			if err := c.setMapping("ctx1", CredentialMapping{Provider: "fake", Profile: "p1"}); err != nil {
+				t.Fatal(err)
+			}
+			if captured, err := c.ensureFresh(context.Background(), "ctx1"); err != nil || !captured {
+				t.Fatalf("initial capture: captured=%v err=%v", captured, err)
+			}
+			c.pauseRefresh("ctx1")
+			if captured, err := c.ensureFresh(context.Background(), "ctx1"); err != nil || captured {
+				t.Fatalf("reconnect: captured=%v err=%v", captured, err)
+			}
+			c.mu.Lock()
+			paused := c.paused["ctx1"]
+			timer := c.timers["ctx1"]
+			c.mu.Unlock()
+			if paused {
+				t.Fatal("reconnected context is still paused")
+			}
+			if (timer != nil) != tc.expiring {
+				t.Fatalf("refresh timer armed=%v, want %v", timer != nil, tc.expiring)
+			}
+			if captured, err := c.ensureFresh(context.Background(), "ctx1"); err != nil || captured {
+				t.Fatalf("reuse: captured=%v err=%v", captured, err)
+			}
+			c.mu.Lock()
+			reusedTimer := c.timers["ctx1"]
+			c.mu.Unlock()
+			if reusedTimer != timer {
+				t.Error("reusing credentials replaced the active refresh timer")
+			}
+			if got := p.captures.Load(); got != 1 {
+				t.Errorf("captures = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestEnsureFreshClearsPaused(t *testing.T) {
+	p := &fakeProvider{name: "fake"}
+	p.set(validCred(), nil)
+	c := testCredManager(t, p)
+	if err := c.setMapping("ctx1", CredentialMapping{Provider: "fake", Profile: "p1"}); err != nil {
+		t.Fatal(err)
+	}
+	c.pauseRefresh("ctx1")
+	if _, err := c.ensureFresh(context.Background(), "ctx1"); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	paused := c.paused["ctx1"]
+	c.mu.Unlock()
+	if paused {
+		t.Error("ensureFresh did not clear the paused flag on reconnect")
+	}
+}
+
+// A capture that was blocked on the prompt must not store its result if the
+// context was remapped to a different profile meanwhile — otherwise the old
+// profile's keys authenticate under the new profile's label.
+func TestCaptureDiscardsResultIfRemappedDuringPrompt(t *testing.T) {
+	p := &fakeProvider{name: "fake", block: make(chan struct{})}
+	p.set(validCred(), nil)
+	c := testCredManager(t, p)
+	if err := c.setMapping("ctx1", CredentialMapping{Provider: "fake", Profile: "profileA"}); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = c.ensureFresh(context.Background(), "ctx1")
+		close(done)
+	}()
+
+	// Let the capture reach the (blocked) provider, then remap to profileB.
+	time.Sleep(50 * time.Millisecond)
+	if err := c.setMapping("ctx1", CredentialMapping{Provider: "fake", Profile: "profileB"}); err != nil {
+		t.Fatal(err)
+	}
+	close(p.block)
+	<-done
+
+	c.mu.Lock()
+	_, stored := c.captured["ctx1"]
+	c.mu.Unlock()
+	if stored {
+		t.Error("capture stored a result for a context remapped mid-prompt")
+	}
+}
+
+func testCredManager(t *testing.T, p CredentialProvider) *credentialManager {
+	t.Helper()
+	return &credentialManager{
+		providers:      []CredentialProvider{p},
+		mappings:       map[string]CredentialMapping{},
+		captured:       map[string]CapturedCredentials{},
+		inflight:       map[string]chan struct{}{},
+		timers:         map[string]*time.Timer{},
+		refreshCancels: map[string]context.CancelFunc{},
+		paused:         map[string]bool{},
+		lastErr:        map[string]string{},
+		storePath:      filepath.Join(t.TempDir(), "mappings.json"),
+		now:            time.Now,
+	}
+}
+
+func validCred() CapturedCredentials {
+	return CapturedCredentials{
+		env:    map[string]string{"AWS_ACCESS_KEY_ID": "a", "AWS_SECRET_ACCESS_KEY": "s"},
+		expiry: time.Now().Add(time.Hour),
+	}
+}
+
+func TestEnsureFresh(t *testing.T) {
+	t.Run("no mapping is a no-op", func(t *testing.T) {
+		p := &fakeProvider{name: "fake"}
+		c := testCredManager(t, p)
+		if captured, err := c.ensureFresh(context.Background(), "ctx1"); err != nil || captured {
+			t.Fatalf("ensureFresh: captured=%v err=%v", captured, err)
+		}
+		if p.captures.Load() != 0 {
+			t.Errorf("captures = %d, want 0", p.captures.Load())
+		}
+	})
+
+	t.Run("captures once then reuses", func(t *testing.T) {
+		p := &fakeProvider{name: "fake"}
+		p.set(validCred(), nil)
+		c := testCredManager(t, p)
+		if err := c.setMapping("ctx1", CredentialMapping{Provider: "fake", Profile: "p1"}); err != nil {
+			t.Fatalf("setMapping: %v", err)
+		}
+		wantCaptured := true
+		for range 3 {
+			captured, err := c.ensureFresh(context.Background(), "ctx1")
+			if err != nil {
+				t.Fatalf("ensureFresh: %v", err)
+			}
+			if captured != wantCaptured {
+				t.Fatalf("captured = %v, want %v", captured, wantCaptured)
+			}
+			wantCaptured = false
+		}
+		if p.captures.Load() != 1 {
+			t.Errorf("captures = %d, want 1", p.captures.Load())
+		}
+		env := c.envFor("ctx1")
+		if env["AWS_ACCESS_KEY_ID"] != "a" {
+			t.Errorf("envFor = %v", env)
+		}
+	})
+
+	t.Run("expired credentials re-capture", func(t *testing.T) {
+		p := &fakeProvider{name: "fake"}
+		p.set(validCred(), nil)
+		c := testCredManager(t, p)
+		_ = c.setMapping("ctx1", CredentialMapping{Provider: "fake", Profile: "p1"})
+		if _, err := c.ensureFresh(context.Background(), "ctx1"); err != nil {
+			t.Fatalf("ensureFresh: %v", err)
+		}
+		c.mu.Lock()
+		cred := c.captured["ctx1"]
+		cred.expiry = time.Now().Add(-time.Minute)
+		c.captured["ctx1"] = cred
+		c.mu.Unlock()
+		if captured, err := c.ensureFresh(context.Background(), "ctx1"); err != nil || !captured {
+			t.Fatalf("ensureFresh after expiry: captured=%v err=%v", captured, err)
+		}
+		if p.captures.Load() != 2 {
+			t.Errorf("captures = %d, want 2", p.captures.Load())
+		}
+	})
+
+	t.Run("capture error emits status and returns error", func(t *testing.T) {
+		p := &fakeProvider{name: "fake"}
+		p.set(CapturedCredentials{}, errors.New("keychain locked"))
+		c := testCredManager(t, p)
+		_ = c.setMapping("ctx1", CredentialMapping{Provider: "fake", Profile: "p1"})
+		var got CredentialStatus
+		c.setOnEvent(func(s CredentialStatus) { got = s })
+		if _, err := c.ensureFresh(context.Background(), "ctx1"); err == nil {
+			t.Fatal("expected error")
+		}
+		if got.State != "error" || got.Error != "keychain locked" {
+			t.Errorf("status = %+v", got)
+		}
+		if env := c.envFor("ctx1"); env != nil {
+			t.Errorf("envFor after failure = %v, want nil", env)
+		}
+	})
+
+	t.Run("concurrent captures single-flight", func(t *testing.T) {
+		p := &fakeProvider{name: "fake", block: make(chan struct{})}
+		p.set(validCred(), nil)
+		c := testCredManager(t, p)
+		_ = c.setMapping("ctx1", CredentialMapping{Provider: "fake", Profile: "p1"})
+		var wg sync.WaitGroup
+		for range 5 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, _ = c.ensureFresh(context.Background(), "ctx1")
+			}()
+		}
+		// Let the goroutines pile up on the in-flight capture, then release.
+		time.Sleep(50 * time.Millisecond)
+		close(p.block)
+		wg.Wait()
+		if got := p.captures.Load(); got != 1 {
+			t.Errorf("captures = %d, want 1", got)
+		}
+	})
+}
+
+func TestSetMappingValidation(t *testing.T) {
+	p := &fakeProvider{name: "fake"}
+	c := testCredManager(t, p)
+	if err := c.setMapping("ctx1", CredentialMapping{Provider: "nope", Profile: "p"}); err == nil {
+		t.Error("expected error for unknown provider")
+	}
+	if err := c.setMapping("ctx1", CredentialMapping{Provider: "fake", Profile: ""}); err == nil {
+		t.Error("expected error for empty profile")
+	}
+}
+
+func TestEnvForRejectsExpiredCredential(t *testing.T) {
+	p := &fakeProvider{name: "fake"}
+	p.set(validCred(), nil)
+	c := testCredManager(t, p)
+	_ = c.setMapping("ctx1", CredentialMapping{Provider: "fake", Profile: "p1"})
+	if _, err := c.ensureFresh(context.Background(), "ctx1"); err != nil {
+		t.Fatalf("ensureFresh: %v", err)
+	}
+	if env := c.envFor("ctx1"); env["AWS_ACCESS_KEY_ID"] != "a" {
+		t.Fatalf("envFor while valid = %v", env)
+	}
+	c.mu.Lock()
+	cred := c.captured["ctx1"]
+	cred.expiry = time.Now().Add(-time.Minute)
+	c.captured["ctx1"] = cred
+	c.mu.Unlock()
+	if env := c.envFor("ctx1"); env != nil {
+		t.Errorf("envFor after expiry = %v, want nil (dead token must not be injected)", env)
+	}
+}
+
+func TestClearMappingDropsCredentials(t *testing.T) {
+	p := &fakeProvider{name: "fake"}
+	p.set(validCred(), nil)
+	c := testCredManager(t, p)
+	_ = c.setMapping("ctx1", CredentialMapping{Provider: "fake", Profile: "p1"})
+	_, _ = c.ensureFresh(context.Background(), "ctx1")
+	if err := c.clearMapping("ctx1"); err != nil {
+		t.Fatalf("clearMapping: %v", err)
+	}
+	if env := c.envFor("ctx1"); env != nil {
+		t.Errorf("envFor after clear = %v, want nil", env)
+	}
+	if got := c.statuses(); len(got) != 0 {
+		t.Errorf("statuses after clear = %v, want empty", got)
+	}
+}
+
+func TestStatuses(t *testing.T) {
+	p := &fakeProvider{name: "fake"}
+	p.set(validCred(), nil)
+	c := testCredManager(t, p)
+	_ = c.setMapping("ctx1", CredentialMapping{Provider: "fake", Profile: "p1"})
+
+	got := c.statuses()
+	if len(got) != 1 || got[0].State != "mapped" {
+		t.Fatalf("statuses = %+v, want one mapped", got)
+	}
+
+	_, _ = c.ensureFresh(context.Background(), "ctx1")
+	got = c.statuses()
+	if got[0].State != "captured" || got[0].ExpiresAt == "" {
+		t.Errorf("statuses after capture = %+v", got[0])
+	}
+
+	c.mu.Lock()
+	cred := c.captured["ctx1"]
+	cred.expiry = time.Now().Add(-time.Minute)
+	c.captured["ctx1"] = cred
+	c.mu.Unlock()
+	got = c.statuses()
+	if got[0].State != "expired" {
+		t.Errorf("statuses after expiry = %+v", got[0])
+	}
+}
+
+func TestRefreshDelay(t *testing.T) {
+	now := time.Date(2026, 6, 11, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name      string
+		remaining time.Duration
+		want      time.Duration
+		ok        bool
+	}{
+		{"long session renews 5min early", time.Hour, 55 * time.Minute, true},
+		{"short session renews at 80%", 9 * time.Minute, 9 * time.Minute * 4 / 5, true},
+		{"very short renews at 80%", 50 * time.Second, 40 * time.Second, true},
+		{"clamps to 30s minimum", 35 * time.Second, 30 * time.Second, true},
+		{"sub-30s skips", 20 * time.Second, 0, false},
+		{"already expired skips", -time.Minute, 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := refreshDelay(now, now.Add(tt.remaining))
+			if ok != tt.ok {
+				t.Fatalf("ok = %v, want %v", ok, tt.ok)
+			}
+			if ok && got != tt.want {
+				t.Errorf("delay = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCredentialMappingsStoreRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sub", "mappings.json")
+
+	missing, err := loadCredentialMappings(path)
+	if err != nil {
+		t.Fatalf("loadCredentialMappings missing file: %v", err)
+	}
+	if len(missing) != 0 {
+		t.Errorf("missing-file mappings = %v, want empty", missing)
+	}
+
+	in := map[string]CredentialMapping{
+		"prod": {Provider: "aws-vault", Profile: "prod-admin"},
+	}
+	if err := saveCredentialMappings(path, in); err != nil {
+		t.Fatalf("saveCredentialMappings: %v", err)
+	}
+	out, err := loadCredentialMappings(path)
+	if err != nil {
+		t.Fatalf("loadCredentialMappings: %v", err)
+	}
+	if out["prod"] != in["prod"] {
+		t.Errorf("round-trip = %+v, want %+v", out, in)
+	}
+}
+
+func TestReconnectTimerRecapturesAndNotifies(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := &fakeProvider{name: "fake"}
+		p.set(validCred(), nil)
+		c := testCredManager(t, p)
+		c.setBaseContext(context.Background())
+		defer c.stopAll()
+		if err := c.setMapping("ctx1", CredentialMapping{Provider: "fake", Profile: "p1"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.ensureFresh(context.Background(), "ctx1"); err != nil {
+			t.Fatal(err)
+		}
+		c.pauseRefresh("ctx1")
+		time.Sleep(10 * time.Minute)
+		if captured, err := c.ensureFresh(context.Background(), "ctx1"); err != nil || captured {
+			t.Fatalf("reconnect: captured=%v err=%v", captured, err)
+		}
+		updated := validCred()
+		updated.env["AWS_ACCESS_KEY_ID"] = "refreshed"
+		p.set(updated, nil)
+		refreshed := make(chan string, 2)
+		c.mu.Lock()
+		c.onRefreshed = func(ctx string) { refreshed <- ctx }
+		c.mu.Unlock()
+		time.Sleep(45*time.Minute - time.Second)
+		synctest.Wait()
+		if p.captures.Load() != 1 {
+			t.Fatal("refresh fired before the ahead-of-expiry window")
+		}
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if p.captures.Load() != 2 || len(refreshed) != 1 {
+			t.Fatalf("capture count=%d, refresh count=%d", p.captures.Load(), len(refreshed))
+		}
+		if got := <-refreshed; got != "ctx1" {
+			t.Fatalf("refreshed context=%q", got)
+		}
+		if c.envFor("ctx1")["AWS_ACCESS_KEY_ID"] != "refreshed" {
+			t.Fatal("refresh did not replace captured credentials")
+		}
+	})
+}

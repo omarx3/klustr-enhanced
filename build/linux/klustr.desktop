@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Klustr
+GenericName=Kubernetes Client
+Comment=Native Kubernetes desktop client
+Exec=klustr
+Icon=klustr
+Categories=Development;System;Network;
+Keywords=kubernetes;k8s;kubectl;helm;cluster;
+Terminal=false
+StartupWMClass=klustr

@@ -1,0 +1,68 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gocritic
+    - misspell
+    - revive
+    - unconvert
+    - unparam
+    - bodyclose
+    - copyloopvar
+    - prealloc
+    - forbidigo
+  settings:
+    forbidigo:
+      forbid:
+        - pattern: ^runtime\.EventsEmit$
+          msg: use emit (app/events.go); Wails corrupts characters above U+FFFF in raw event payloads
+    revive:
+      rules:
+        - name: var-naming
+        - name: exported
+          disabled: true
+        - name: package-comments
+          disabled: true
+    gocritic:
+      disabled-checks:
+        - ifElseChain
+        - hugeParam
+  exclusions:
+    paths:
+      - frontend/node_modules
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - unparam
+      - path: frontend/src/lib/wails/
+        linters:
+          - revive
+          - staticcheck
+          - unused
+      - path: app/events\.go
+        linters:
+          - forbidigo
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - klustr
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

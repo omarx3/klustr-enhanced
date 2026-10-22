@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#312e81"/>
+      <stop offset="100%" stop-color="#1e1b4b"/>
+    </linearGradient>
+    <linearGradient id="kstem" gradientUnits="userSpaceOnUse" x1="320" y1="142" x2="320" y2="882">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#c7d2fe"/>
+    </linearGradient>
+    <linearGradient id="kup" gradientUnits="userSpaceOnUse" x1="320" y1="142" x2="320" y2="602">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#c7d2fe"/>
+    </linearGradient>
+    <linearGradient id="klo" gradientUnits="userSpaceOnUse" x1="320" y1="422" x2="320" y2="882">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#c7d2fe"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="1024" height="1024" rx="229" ry="229" fill="url(#bg)"/>
+  <g stroke-width="180" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <line x1="320" y1="232" x2="320" y2="792" stroke="url(#kstem)"/>
+    <line x1="320" y1="512" x2="704" y2="232" stroke="url(#kup)"/>
+    <line x1="320" y1="512" x2="704" y2="792" stroke="url(#klo)"/>
+  </g>
+  <circle cx="320" cy="512" r="40" fill="#818cf8"/>
+</svg>

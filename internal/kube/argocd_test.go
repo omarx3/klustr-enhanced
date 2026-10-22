@@ -1,0 +1,308 @@
+package kube
+
+import (
+	"encoding/json"
+	"testing"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+)
+
+func TestBuildArgoSyncPatch(t *testing.T) {
+	tests := []struct {
+		name string
+		opts ArgoSyncOptions
+		want string
+	}{
+		{
+			name: "defaults to HEAD and hook strategy",
+			want: `{"operation":{"initiatedBy":{"automated":false,"username":"klustr"},"sync":{"dryRun":false,"prune":false,"revision":"HEAD","syncStrategy":{"hook":{}}}}}`,
+		},
+		{
+			name: "apply strategy with force and sync options",
+			opts: ArgoSyncOptions{
+				Revision:        "v1.2.3",
+				DryRun:          true,
+				Prune:           true,
+				Force:           true,
+				Replace:         true,
+				ServerSideApply: true,
+				Strategy:        "apply",
+			},
+			want: `{"operation":{"initiatedBy":{"automated":false,"username":"klustr"},"sync":{"dryRun":true,"prune":true,"revision":"v1.2.3","syncOptions":["Replace=true","ServerSideApply=true"],"syncStrategy":{"apply":{"force":true}}}}}`,
+		},
+		{
+			name: "selective sync preserves cluster-scoped namespace",
+			opts: ArgoSyncOptions{
+				Resources: []ArgoSyncResourceSelector{
+					{Group: "apps", Kind: "Deployment", Name: "api", Namespace: "prod"},
+					{Group: "", Kind: "Namespace", Name: "prod", Namespace: ""},
+				},
+			},
+			want: `{"operation":{"initiatedBy":{"automated":false,"username":"klustr"},"sync":{"dryRun":false,"prune":false,"resources":[{"group":"apps","kind":"Deployment","name":"api","namespace":"prod"},{"group":"","kind":"Namespace","name":"prod","namespace":""}],"revision":"HEAD","syncStrategy":{"hook":{}}}}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := json.Marshal(buildArgoSyncPatch(tt.opts))
+			if err != nil {
+				t.Fatalf("marshal patch: %v", err)
+			}
+			if string(got) != tt.want {
+				t.Fatalf("patch mismatch\ngot:  %s\nwant: %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildArgoRollbackPatch(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		id    int64
+		prune bool
+		want  string
+	}{
+		{
+			name: "without prune",
+			id:   42,
+			want: `{"operation":{"initiatedBy":{"automated":false,"username":"klustr"},"rollback":{"id":42,"prune":false}}}`,
+		},
+		{
+			name:  "with prune",
+			id:    99,
+			prune: true,
+			want:  `{"operation":{"initiatedBy":{"automated":false,"username":"klustr"},"rollback":{"id":99,"prune":true}}}`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := json.Marshal(buildArgoRollbackPatch(tt.id, tt.prune))
+			if err != nil {
+				t.Fatalf("marshal patch: %v", err)
+			}
+			if string(got) != tt.want {
+				t.Fatalf("patch mismatch\ngot:  %s\nwant: %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExtractArgoApplication(t *testing.T) {
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{
+			"name":      "demo-app",
+			"namespace": "argocd",
+		},
+		"spec": map[string]any{
+			"project": "default",
+			"source": map[string]any{
+				"repoURL":        "https://github.com/example/repo",
+				"path":           "manifests/prod",
+				"targetRevision": "main",
+			},
+			"syncPolicy": map[string]any{
+				"automated": map[string]any{
+					"selfHeal": true,
+					"prune":    false,
+				},
+			},
+		},
+		"status": map[string]any{
+			"sync":   map[string]any{"status": "Synced", "revision": "abc123"},
+			"health": map[string]any{"status": "Healthy"},
+		},
+	}}
+
+	got := extractArgoApplication(obj)
+	if got.Name != "demo-app" || got.Namespace != "argocd" {
+		t.Errorf("identity wrong: %+v", got)
+	}
+	if got.Sync != "Synced" || got.Health != "Healthy" || got.Revision != "abc123" {
+		t.Errorf("status fields wrong: %+v", got)
+	}
+	if got.Project != "default" || got.RepoURL != "https://github.com/example/repo" ||
+		got.Path != "manifests/prod" || got.TargetRevision != "main" {
+		t.Errorf("source fields wrong: %+v", got)
+	}
+	if !got.AutoSync || !got.SelfHeal || got.Prune {
+		t.Errorf("auto policy flags wrong: %+v", got)
+	}
+}
+
+func TestExtractArgoApplicationDefaults(t *testing.T) {
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"name": "bare", "namespace": "argocd"},
+		"spec":     map[string]any{},
+	}}
+	got := extractArgoApplication(obj)
+	if got.Sync != "" || got.Health != "" || got.Project != "" {
+		t.Errorf("missing fields should default to empty: %+v", got)
+	}
+	if got.AutoSync || got.SelfHeal || got.Prune {
+		t.Errorf("missing automated block should leave flags false: %+v", got)
+	}
+}
+
+func TestExtractArgoApplicationMultiSource(t *testing.T) {
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"name": "multi", "namespace": "argocd"},
+		"spec": map[string]any{
+			"sources": []any{
+				map[string]any{
+					"repoURL":        "https://github.com/example/repo",
+					"path":           "manifests",
+					"targetRevision": "main",
+				},
+				map[string]any{"repoURL": "https://charts.example.com", "chart": "redis"},
+			},
+		},
+	}}
+	got := extractArgoApplication(obj)
+	if got.RepoURL != "https://github.com/example/repo" {
+		t.Errorf("RepoURL: got %q", got.RepoURL)
+	}
+	if got.Path != "manifests" || got.TargetRevision != "main" {
+		t.Errorf("Path/TargetRevision: got %q / %q", got.Path, got.TargetRevision)
+	}
+}
+
+func TestExtractArgoApplicationMultiSourceChart(t *testing.T) {
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"name": "chart", "namespace": "argocd"},
+		"spec": map[string]any{
+			"sources": []any{
+				map[string]any{"repoURL": "https://charts.example.com", "chart": "redis", "targetRevision": "18.0.0"},
+			},
+		},
+	}}
+	got := extractArgoApplication(obj)
+	if got.Path != "redis" {
+		t.Errorf("chart source should fall back to chart name for Path: got %q", got.Path)
+	}
+}
+
+func TestExtractArgoApplicationAutomatedWithoutFlags(t *testing.T) {
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"name": "auto", "namespace": "argocd"},
+		"spec": map[string]any{
+			"syncPolicy": map[string]any{"automated": map[string]any{}},
+		},
+	}}
+	got := extractArgoApplication(obj)
+	if !got.AutoSync {
+		t.Error("automated{} block should still flip AutoSync true")
+	}
+	if got.SelfHeal || got.Prune {
+		t.Errorf("flags should remain false: %+v", got)
+	}
+}
+
+func TestExtractArgoResources(t *testing.T) {
+	t.Run("no status.resources returns empty slice", func(t *testing.T) {
+		obj := &unstructured.Unstructured{Object: map[string]any{"status": map[string]any{}}}
+		out := extractArgoResources(obj)
+		if out == nil {
+			t.Fatal("should return empty slice, not nil")
+		}
+		if len(out) != 0 {
+			t.Errorf("got %d, want 0", len(out))
+		}
+	})
+
+	t.Run("happy path", func(t *testing.T) {
+		obj := &unstructured.Unstructured{Object: map[string]any{
+			"status": map[string]any{
+				"resources": []any{
+					map[string]any{
+						"group":     "apps",
+						"version":   "v1",
+						"kind":      "Deployment",
+						"namespace": "prod",
+						"name":      "api",
+						"status":    "Synced",
+						"health": map[string]any{
+							"status":  "Healthy",
+							"message": "Ready",
+						},
+					},
+				},
+			},
+		}}
+		out := extractArgoResources(obj)
+		if len(out) != 1 {
+			t.Fatalf("got %d", len(out))
+		}
+		r := out[0]
+		if r.Kind != "Deployment" || r.Name != "api" || r.Namespace != "prod" {
+			t.Errorf("identity wrong: %+v", r)
+		}
+		if r.Sync != "Synced" || r.Health != "Healthy" || r.Message != "Ready" {
+			t.Errorf("status fields wrong: %+v", r)
+		}
+	})
+
+	t.Run("skips entries missing kind or name", func(t *testing.T) {
+		obj := &unstructured.Unstructured{Object: map[string]any{
+			"status": map[string]any{
+				"resources": []any{
+					map[string]any{"kind": "Deployment"},
+					map[string]any{"name": "lonely"},
+					map[string]any{"kind": "Service", "name": "svc"},
+				},
+			},
+		}}
+		out := extractArgoResources(obj)
+		if len(out) != 1 || out[0].Kind != "Service" {
+			t.Errorf("got %+v", out)
+		}
+	})
+}
+
+func TestExtractArgoHealth(t *testing.T) {
+	t.Run("degraded without persisted resource health", func(t *testing.T) {
+		obj := &unstructured.Unstructured{Object: map[string]any{
+			"spec": map[string]any{
+				"destination": map[string]any{"name": "dev-primary", "namespace": "staging"},
+			},
+			"status": map[string]any{
+				"health": map[string]any{"status": "Degraded"},
+				"resources": []any{
+					map[string]any{"kind": "Deployment", "name": "x", "status": "Synced"},
+				},
+			},
+		}}
+		h := extractArgoHealth(obj)
+		if h.Status != "Degraded" || h.DestName != "dev-primary" || h.DestNamespace != "staging" {
+			t.Fatalf("got %+v", h)
+		}
+		if h.ResourceHealthPersisted {
+			t.Errorf("expected ResourceHealthPersisted=false, got true")
+		}
+		if len(h.Conditions) != 0 {
+			t.Errorf("expected no conditions, got %+v", h.Conditions)
+		}
+	})
+
+	t.Run("persisted resource health and conditions", func(t *testing.T) {
+		obj := &unstructured.Unstructured{Object: map[string]any{
+			"status": map[string]any{
+				"health": map[string]any{"status": "Degraded", "message": "boom"},
+				"conditions": []any{
+					map[string]any{"type": "ComparisonError", "message": "cannot compare"},
+				},
+				"resources": []any{
+					map[string]any{"kind": "Deployment", "name": "x", "health": map[string]any{"status": "Degraded"}},
+				},
+			},
+		}}
+		h := extractArgoHealth(obj)
+		if !h.ResourceHealthPersisted {
+			t.Errorf("expected ResourceHealthPersisted=true")
+		}
+		if h.Message != "boom" {
+			t.Errorf("got message %q", h.Message)
+		}
+		if len(h.Conditions) != 1 || h.Conditions[0].Type != "ComparisonError" {
+			t.Fatalf("got conditions %+v", h.Conditions)
+		}
+	})
+}

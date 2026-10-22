@@ -1,0 +1,339 @@
+package kube
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	pfconstants "k8s.io/apimachinery/pkg/util/portforward"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/portforward"
+	clientspdy "k8s.io/client-go/transport/spdy"
+	clientwebsocket "k8s.io/client-go/transport/websocket"
+	"k8s.io/streaming/pkg/httpstream"
+	httpstreamspdy "k8s.io/streaming/pkg/httpstream/spdy"
+)
+
+const pfReadyTimeout = 10 * time.Second
+
+type PortForwardInfo struct {
+	ID         string `json:"id"`
+	Context    string `json:"context"`
+	Namespace  string `json:"namespace"`
+	PodName    string `json:"podName"`
+	LocalPort  uint16 `json:"localPort"`
+	RemotePort uint16 `json:"remotePort"`
+	// ServiceName and ServicePort are set for a forward started from a Service:
+	// the tunnel still runs to one backing pod (as kubectl does), and these
+	// keep the Service identity so the UI can tag and stop it by Service.
+	ServiceName string `json:"serviceName"`
+	ServicePort int32  `json:"servicePort"`
+	Status      string `json:"status"`
+	Error       string `json:"error"`
+}
+
+type pfChangeFunc func()
+
+type pfSession struct {
+	info   PortForwardInfo
+	cancel context.CancelFunc
+}
+
+func (s *pfSession) close() {
+	s.cancel()
+}
+
+type portForwarder interface {
+	ForwardPorts() error
+	GetPorts() ([]portforward.ForwardedPort, error)
+}
+
+type pfDialer func(...string) (httpstream.Connection, string, error)
+
+func (d pfDialer) Dial(protocols ...string) (httpstream.Connection, string, error) {
+	return d(protocols...)
+}
+
+type pfManager struct {
+	mu       sync.Mutex
+	sessions map[string]*pfSession
+	counter  uint64
+	onChange pfChangeFunc
+}
+
+func newPFManager() *pfManager {
+	return &pfManager{sessions: make(map[string]*pfSession)}
+}
+
+func (mgr *pfManager) setOnChange(cb pfChangeFunc) {
+	mgr.mu.Lock()
+	mgr.onChange = cb
+	mgr.mu.Unlock()
+}
+
+func (mgr *pfManager) notify() {
+	mgr.mu.Lock()
+	cb := mgr.onChange
+	mgr.mu.Unlock()
+	if cb != nil {
+		cb()
+	}
+}
+
+func newPortForwarder(
+	ctx context.Context,
+	cs *kubernetes.Clientset,
+	restCfg *rest.Config,
+	namespace, podName string,
+	localPort, remotePort uint16,
+	readyCh chan struct{},
+) (portForwarder, error) {
+	transport, upgrader, err := newStreamingSPDYTransport(ctx, restCfg)
+	if err != nil {
+		return nil, err
+	}
+	client := &http.Client{Transport: transport}
+	url := cs.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Namespace(namespace).
+		Name(podName).
+		SubResource("portforward").
+		URL()
+	spdyDialer := pfDialer(func(protocols ...string) (httpstream.Connection, string, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url.String(), nil)
+		if err != nil {
+			return nil, "", err
+		}
+		return clientspdy.NegotiateStreaming(upgrader, client, req, protocols...)
+	})
+	websocketDialer, err := newPFWebSocketDialer(ctx, restCfg, url)
+	if err != nil {
+		return nil, err
+	}
+	dialer := portforward.NewFallbackDialerForStreaming(websocketDialer, spdyDialer, func(err error) bool {
+		return ctx.Err() == nil && shouldFallbackStreaming(err)
+	})
+	ports := []string{fmt.Sprintf("%d:%d", localPort, remotePort)}
+	return portforward.NewOnAddressesForStreamingWithContext(ctx, dialer, []string{"localhost"}, ports, readyCh, io.Discard, io.Discard)
+}
+
+func newPFWebSocketDialer(ctx context.Context, cfg *rest.Config, endpoint *url.URL) (httpstream.Dialer, error) {
+	transport, holder, err := clientwebsocket.RoundTripperFor(streamingWebSocketConfig(ctx, cfg))
+	if err != nil {
+		return nil, err
+	}
+	return pfDialer(func(protocols ...string) (httpstream.Connection, string, error) {
+		// The upstream tunneling dialer creates a background-context request.
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+		if err != nil {
+			return nil, "", err
+		}
+		tunneled := make([]string, len(protocols))
+		for i, protocol := range protocols {
+			tunneled[i] = pfconstants.WebsocketsSPDYTunnelingPrefix + protocol
+		}
+		conn, err := clientwebsocket.Negotiate(transport, holder, req, tunneled...)
+		if err != nil {
+			return nil, "", err
+		}
+		stream, err := httpstreamspdy.NewClientConnectionWithPings(portforward.NewTunnelingConnection("client", conn), portforward.PingPeriod)
+		if err != nil {
+			_ = conn.Close()
+			return nil, "", err
+		}
+		return stream, strings.TrimPrefix(conn.Subprotocol(), pfconstants.WebsocketsSPDYTunnelingPrefix), nil
+	}), nil
+}
+
+func (mgr *pfManager) start(
+	contextName, namespace, podName string,
+	build func(context.Context, chan struct{}) (portForwarder, error),
+) (PortForwardInfo, error) {
+	return mgr.startWith(PortForwardInfo{Context: contextName, Namespace: namespace, PodName: podName}, build)
+}
+
+// startWith runs a forward whose identity fields (context, namespace, pod and
+// optional service) come from base; the ports are filled in once ready.
+func (mgr *pfManager) startWith(
+	base PortForwardInfo,
+	build func(context.Context, chan struct{}) (portForwarder, error),
+) (PortForwardInfo, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	id := fmt.Sprintf("pf-%d", atomic.AddUint64(&mgr.counter, 1))
+	pending := base
+	pending.ID = id
+	pending.Status = "starting"
+	sess := &pfSession{
+		info:   pending,
+		cancel: cancel,
+	}
+	mgr.mu.Lock()
+	mgr.sessions[id] = sess
+	mgr.mu.Unlock()
+	started := false
+	defer func() {
+		if !started {
+			mgr.stop(id)
+		}
+	}()
+
+	readyCh := make(chan struct{})
+	forwarder, err := build(ctx, readyCh)
+	if err != nil {
+		return PortForwardInfo{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return PortForwardInfo{}, err
+	}
+	resultCh := make(chan error, 1)
+
+	go func() {
+		resultCh <- forwarder.ForwardPorts()
+	}()
+
+	select {
+	case <-ctx.Done():
+		return PortForwardInfo{}, ctx.Err()
+	case <-readyCh:
+	case err := <-resultCh:
+		if err == nil {
+			err = errors.New("port-forward terminated before ready")
+		}
+		return PortForwardInfo{}, err
+	case <-time.After(pfReadyTimeout):
+		return PortForwardInfo{}, fmt.Errorf("timed out waiting for port-forward to become ready")
+	}
+
+	actualPorts, err := forwarder.GetPorts()
+	if err != nil || len(actualPorts) == 0 {
+		if err == nil {
+			err = errors.New("no ports reported by forwarder")
+		}
+		return PortForwardInfo{}, err
+	}
+
+	info := base
+	info.ID = id
+	info.LocalPort = actualPorts[0].Local
+	info.RemotePort = actualPorts[0].Remote
+	info.Status = "ready"
+	info.Error = ""
+	mgr.mu.Lock()
+	if mgr.sessions[id] != sess {
+		mgr.mu.Unlock()
+		return PortForwardInfo{}, context.Canceled
+	}
+	sess.info = info
+	mgr.mu.Unlock()
+	started = true
+	mgr.notify()
+
+	go func() {
+		defer cancel()
+		err := <-resultCh
+		mgr.mu.Lock()
+		s, ok := mgr.sessions[id]
+		if ok {
+			if err != nil {
+				// Keep the errored session listed until the user dismisses
+				// it via stop() — deleting here would make the forward
+				// vanish with no explanation of why it died.
+				s.info.Status = "error"
+				s.info.Error = err.Error()
+			} else {
+				s.info.Status = "closed"
+				delete(mgr.sessions, id)
+			}
+		}
+		mgr.mu.Unlock()
+		mgr.notify()
+	}()
+
+	return info, nil
+}
+
+func (mgr *pfManager) stop(id string) {
+	mgr.mu.Lock()
+	sess, ok := mgr.sessions[id]
+	// Remove and notify synchronously for every stop, not just dismissing an
+	// errored one. Otherwise a healthy stop only updated the UI when the monitor
+	// goroutine woke as ForwardPorts returned, which can lag on a wedged SPDY
+	// connection. The monitor's ok-check no-ops on the already-removed id, and
+	// an errored session's monitor has already exited.
+	if ok {
+		delete(mgr.sessions, id)
+	}
+	mgr.mu.Unlock()
+	if !ok {
+		return
+	}
+	sess.close()
+	mgr.notify()
+}
+
+func (mgr *pfManager) list() []PortForwardInfo {
+	mgr.mu.Lock()
+	out := make([]PortForwardInfo, 0, len(mgr.sessions))
+	for _, s := range mgr.sessions {
+		if s.info.Status == "starting" {
+			continue
+		}
+		out = append(out, s.info)
+	}
+	mgr.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// stopForContext closes every port-forward of the given context, so a
+// disconnect releases its local listeners, and notifies the frontend. Each
+// session's monitor goroutine then finds its id gone and does nothing.
+func (mgr *pfManager) stopForContext(contextName string) {
+	mgr.stopMatching(func(i PortForwardInfo) bool { return i.Context == contextName })
+}
+
+// stopMatching closes every session whose info matches, including ones still
+// starting, and notifies once if any were closed.
+func (mgr *pfManager) stopMatching(match func(PortForwardInfo) bool) {
+	mgr.mu.Lock()
+	closing := make([]*pfSession, 0)
+	for id, s := range mgr.sessions {
+		if match(s.info) {
+			closing = append(closing, s)
+			delete(mgr.sessions, id)
+		}
+	}
+	mgr.mu.Unlock()
+	if len(closing) == 0 {
+		return
+	}
+	for _, s := range closing {
+		s.close()
+	}
+	mgr.notify()
+}
+
+// stopAll closes every active port-forward. Called from
+// ClientManager.Shutdown so the local listeners are released cleanly on
+// app quit instead of being killed mid-connection.
+func (mgr *pfManager) stopAll() {
+	mgr.mu.Lock()
+	sessions := make([]*pfSession, 0, len(mgr.sessions))
+	for _, s := range mgr.sessions {
+		sessions = append(sessions, s)
+	}
+	mgr.sessions = make(map[string]*pfSession)
+	mgr.mu.Unlock()
+	for _, s := range sessions {
+		s.close()
+	}
+}

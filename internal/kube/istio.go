@@ -1,0 +1,426 @@
+package kube
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+)
+
+// Istio read-only typed views. Istio serves these kinds at versions that vary
+// by install (v1 / v1beta1 / v1alpha3).
+var (
+	istioVirtualServiceGR     = schema.GroupResource{Group: "networking.istio.io", Resource: "virtualservices"}
+	istioDestinationRuleGR    = schema.GroupResource{Group: "networking.istio.io", Resource: "destinationrules"}
+	istioPeerAuthenticationGR = schema.GroupResource{Group: "security.istio.io", Resource: "peerauthentications"}
+)
+
+// ---------------------------------------------------------------------------
+// VirtualService
+// ---------------------------------------------------------------------------
+
+type IstioDestinationWeight struct {
+	Host   string `json:"host"`
+	Subset string `json:"subset"`
+	Port   int64  `json:"port"`
+	Weight int64  `json:"weight"`
+	// ServiceNamespace and ServiceName are the cluster Service the host
+	// resolves to, "" when it is not one.
+	ServiceNamespace string `json:"serviceNamespace"`
+	ServiceName      string `json:"serviceName"`
+}
+
+type IstioRouteRule struct {
+	Match        string                   `json:"match"`
+	Destinations []IstioDestinationWeight `json:"destinations"`
+}
+
+type IstioVirtualServiceInfo struct {
+	Name      string   `json:"name"`
+	Namespace string   `json:"namespace"`
+	Hosts     []string `json:"hosts"`
+	Gateways  []string `json:"gateways"`
+	HTTPCount int      `json:"httpCount"`
+	TLSCount  int      `json:"tlsCount"`
+	TCPCount  int      `json:"tcpCount"`
+	CreatedAt string   `json:"createdAt"`
+}
+
+type IstioVirtualServiceDetail struct {
+	IstioVirtualServiceInfo
+	HTTPRoutes []IstioRouteRule `json:"httpRoutes"`
+	TLSRoutes  []IstioRouteRule `json:"tlsRoutes"`
+	TCPRoutes  []IstioRouteRule `json:"tcpRoutes"`
+	// HostServices resolves each of spec.hosts to a cluster Service.
+	HostServices []IstioServiceRef `json:"hostServices"`
+	// GatewayRefs are the Istio Gateways the routes bind to; the reserved
+	// "mesh" gateway (the sidecars) is left out.
+	GatewayRefs []IstioObjectRef `json:"gatewayRefs"`
+}
+
+func (m *ClientManager) ListIstioVirtualServices(contextName, namespace string) []IstioVirtualServiceInfo {
+	return listServedRows(m, contextName, istioVirtualServiceGR, namespace, extractVirtualService,
+		func(r IstioVirtualServiceInfo) (string, string) { return r.Namespace, r.Name })
+}
+
+func (m *ClientManager) GetIstioVirtualService(ctx context.Context, contextName, namespace, name string) (*IstioVirtualServiceDetail, error) {
+	obj, err := m.getServedCR(ctx, contextName, istioVirtualServiceGR, namespace, name)
+	if err != nil {
+		return nil, err
+	}
+	d := &IstioVirtualServiceDetail{
+		IstioVirtualServiceInfo: extractVirtualService(obj),
+		HTTPRoutes:              extractRouteRules(obj, "http"),
+		TLSRoutes:               extractRouteRules(obj, "tls"),
+		TCPRoutes:               extractRouteRules(obj, "tcp"),
+		HostServices:            []IstioServiceRef{},
+	}
+	d.GatewayRefs = istioGatewayRefs(namespace, d.Gateways)
+	for _, host := range d.Hosts {
+		d.HostServices = append(d.HostServices, m.istioServiceRef(contextName, host, namespace))
+	}
+	for _, rules := range [][]IstioRouteRule{d.HTTPRoutes, d.TLSRoutes, d.TCPRoutes} {
+		for i := range rules {
+			for j := range rules[i].Destinations {
+				dest := &rules[i].Destinations[j]
+				ref := m.istioServiceRef(contextName, dest.Host, namespace)
+				dest.ServiceNamespace, dest.ServiceName = ref.Namespace, ref.Name
+			}
+		}
+	}
+	return d, nil
+}
+
+// istioGatewayRefs resolves VirtualService gateway names, "name" in the
+// VirtualService's namespace or "namespace/name", skipping "mesh".
+func istioGatewayRefs(namespace string, gateways []string) []IstioObjectRef {
+	out := []IstioObjectRef{}
+	for _, g := range gateways {
+		if g == "" || g == "mesh" {
+			continue
+		}
+		if ns, name, ok := strings.Cut(g, "/"); ok {
+			out = append(out, IstioObjectRef{Namespace: ns, Name: name})
+		} else {
+			out = append(out, IstioObjectRef{Namespace: namespace, Name: g})
+		}
+	}
+	return out
+}
+
+func extractVirtualService(obj *unstructured.Unstructured) IstioVirtualServiceInfo {
+	hosts, _, _ := unstructured.NestedStringSlice(obj.Object, "spec", "hosts")
+	gateways, _, _ := unstructured.NestedStringSlice(obj.Object, "spec", "gateways")
+	httpRules, _, _ := nestedSliceNoCopy(obj.Object, "spec", "http")
+	tlsRules, _, _ := nestedSliceNoCopy(obj.Object, "spec", "tls")
+	tcpRules, _, _ := nestedSliceNoCopy(obj.Object, "spec", "tcp")
+	return IstioVirtualServiceInfo{
+		Name:      obj.GetName(),
+		Namespace: obj.GetNamespace(),
+		Hosts:     append([]string{}, hosts...),
+		Gateways:  append([]string{}, gateways...),
+		HTTPCount: len(httpRules),
+		TLSCount:  len(tlsRules),
+		TCPCount:  len(tcpRules),
+		CreatedAt: obj.GetCreationTimestamp().UTC().Format(time.RFC3339),
+	}
+}
+
+func extractRouteRules(obj *unstructured.Unstructured, field string) []IstioRouteRule {
+	raw, _, _ := nestedSliceNoCopy(obj.Object, "spec", field)
+	out := make([]IstioRouteRule, 0, len(raw))
+	for _, item := range raw {
+		rule, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		out = append(out, IstioRouteRule{
+			Match:        summariseMatch(rule),
+			Destinations: extractDestinations(rule),
+		})
+	}
+	return out
+}
+
+func extractDestinations(rule map[string]any) []IstioDestinationWeight {
+	routes, ok := rule["route"].([]any)
+	if !ok {
+		return []IstioDestinationWeight{}
+	}
+	out := make([]IstioDestinationWeight, 0, len(routes))
+	for _, r := range routes {
+		rm, ok := r.(map[string]any)
+		if !ok {
+			continue
+		}
+		dest, _ := rm["destination"].(map[string]any)
+		host, _ := dest["host"].(string)
+		subset, _ := dest["subset"].(string)
+		var port int64
+		if p, ok := dest["port"].(map[string]any); ok {
+			port = toInt64(p["number"])
+		}
+		out = append(out, IstioDestinationWeight{
+			Host:   host,
+			Subset: subset,
+			Port:   port,
+			Weight: toInt64(rm["weight"]),
+		})
+	}
+	return out
+}
+
+// summariseMatch renders an Istio route rule's match conditions into a compact
+// string for the routing table. It handles the common HTTP (uri/method/header),
+// TLS (sniHosts) and TCP (port) match shapes; an absent match means "match all".
+func summariseMatch(rule map[string]any) string {
+	matches, ok := rule["match"].([]any)
+	if !ok || len(matches) == 0 {
+		return "any"
+	}
+	parts := make([]string, 0, len(matches))
+	for _, m := range matches {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		if uri, ok := mm["uri"].(map[string]any); ok {
+			for kind, v := range uri {
+				if s, ok := v.(string); ok {
+					parts = append(parts, fmt.Sprintf("uri %s %s", kind, s))
+				}
+			}
+		}
+		if method, ok := mm["method"].(map[string]any); ok {
+			for kind, v := range method {
+				if s, ok := v.(string); ok {
+					parts = append(parts, fmt.Sprintf("method %s %s", kind, s))
+				}
+			}
+		}
+		if headers, ok := mm["headers"].(map[string]any); ok && len(headers) > 0 {
+			parts = append(parts, fmt.Sprintf("%d header match", len(headers)))
+		}
+		if sni, ok := mm["sniHosts"].([]any); ok && len(sni) > 0 {
+			hosts := make([]string, 0, len(sni))
+			for _, h := range sni {
+				if s, ok := h.(string); ok {
+					hosts = append(hosts, s)
+				}
+			}
+			parts = append(parts, "sni "+strings.Join(hosts, ","))
+		}
+		if port, ok := mm["port"]; ok {
+			if n := toInt64(port); n > 0 {
+				parts = append(parts, fmt.Sprintf("port %d", n))
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return "any"
+	}
+	return strings.Join(parts, ", ")
+}
+
+// ---------------------------------------------------------------------------
+// DestinationRule
+// ---------------------------------------------------------------------------
+
+type IstioSubset struct {
+	Name   string            `json:"name"`
+	Labels map[string]string `json:"labels"`
+	// Workloads are the host Service's pods that also carry the subset's
+	// labels, the endpoints traffic to the subset reaches.
+	Workloads IstioWorkloads `json:"workloads"`
+}
+
+type IstioDestinationRuleInfo struct {
+	Name      string   `json:"name"`
+	Namespace string   `json:"namespace"`
+	Host      string   `json:"host"`
+	Subsets   []string `json:"subsets"`
+	TLSMode   string   `json:"tlsMode"`
+	CreatedAt string   `json:"createdAt"`
+}
+
+type IstioDestinationRuleDetail struct {
+	IstioDestinationRuleInfo
+	SubsetDetails []IstioSubset `json:"subsetDetails"`
+	LoadBalancer  string        `json:"loadBalancer"`
+	// Service is the cluster Service spec.host resolves to.
+	Service IstioServiceRef `json:"service"`
+}
+
+func (m *ClientManager) ListIstioDestinationRules(contextName, namespace string) []IstioDestinationRuleInfo {
+	return listServedRows(m, contextName, istioDestinationRuleGR, namespace, extractDestinationRule,
+		func(r IstioDestinationRuleInfo) (string, string) { return r.Namespace, r.Name })
+}
+
+func (m *ClientManager) GetIstioDestinationRule(ctx context.Context, contextName, namespace, name string) (*IstioDestinationRuleDetail, error) {
+	obj, err := m.getServedCR(ctx, contextName, istioDestinationRuleGR, namespace, name)
+	if err != nil {
+		return nil, err
+	}
+	lb, _, _ := unstructured.NestedString(obj.Object, "spec", "trafficPolicy", "loadBalancer", "simple")
+	d := &IstioDestinationRuleDetail{
+		IstioDestinationRuleInfo: extractDestinationRule(obj),
+		SubsetDetails:            extractSubsets(obj),
+		LoadBalancer:             lb,
+	}
+	d.Service = IstioServiceRef{Host: d.Host}
+	w, ok := m.watcher(contextName)
+	if !ok {
+		return d, nil
+	}
+	svc, found := w.istioService(d.Host, namespace)
+	if !found {
+		return d, nil
+	}
+	d.Service.Namespace, d.Service.Name = svc.Namespace, svc.Name
+	// A Service without a selector has hand-managed endpoints that no label
+	// set describes.
+	if len(svc.Spec.Selector) == 0 {
+		return d, nil
+	}
+	for i := range d.SubsetDetails {
+		sel := istioSubsetSelector(svc.Spec.Selector, d.SubsetDetails[i].Labels)
+		d.SubsetDetails[i].Workloads = m.istioWorkloads(contextName, svc.Namespace, sel)
+	}
+	return d, nil
+}
+
+func extractDestinationRule(obj *unstructured.Unstructured) IstioDestinationRuleInfo {
+	host, _, _ := unstructured.NestedString(obj.Object, "spec", "host")
+	tlsMode, _, _ := unstructured.NestedString(obj.Object, "spec", "trafficPolicy", "tls", "mode")
+	subsets := extractSubsets(obj)
+	names := make([]string, 0, len(subsets))
+	for _, s := range subsets {
+		names = append(names, s.Name)
+	}
+	return IstioDestinationRuleInfo{
+		Name:      obj.GetName(),
+		Namespace: obj.GetNamespace(),
+		Host:      host,
+		Subsets:   names,
+		TLSMode:   tlsMode,
+		CreatedAt: obj.GetCreationTimestamp().UTC().Format(time.RFC3339),
+	}
+}
+
+func extractSubsets(obj *unstructured.Unstructured) []IstioSubset {
+	raw, _, _ := nestedSliceNoCopy(obj.Object, "spec", "subsets")
+	out := make([]IstioSubset, 0, len(raw))
+	for _, item := range raw {
+		sm, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := sm["name"].(string)
+		labels := map[string]string{}
+		if lm, ok := sm["labels"].(map[string]any); ok {
+			for k, v := range lm {
+				if s, ok := v.(string); ok {
+					labels[k] = s
+				}
+			}
+		}
+		out = append(out, IstioSubset{Name: name, Labels: labels, Workloads: IstioWorkloads{Pods: []IstioObjectRef{}}})
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// PeerAuthentication
+// ---------------------------------------------------------------------------
+
+type IstioPortMTLS struct {
+	Port int64  `json:"port"`
+	Mode string `json:"mode"`
+}
+
+type IstioPeerAuthenticationInfo struct {
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+	MTLSMode  string `json:"mtlsMode"`
+	Selector  string `json:"selector"`
+	CreatedAt string `json:"createdAt"`
+}
+
+type IstioPeerAuthenticationDetail struct {
+	IstioPeerAuthenticationInfo
+	SelectorLabels map[string]string `json:"selectorLabels"`
+	PortLevel      []IstioPortMTLS   `json:"portLevel"`
+}
+
+func (m *ClientManager) ListIstioPeerAuthentications(contextName, namespace string) []IstioPeerAuthenticationInfo {
+	return listServedRows(m, contextName, istioPeerAuthenticationGR, namespace, extractPeerAuthentication,
+		func(r IstioPeerAuthenticationInfo) (string, string) { return r.Namespace, r.Name })
+}
+
+func (m *ClientManager) GetIstioPeerAuthentication(ctx context.Context, contextName, namespace, name string) (*IstioPeerAuthenticationDetail, error) {
+	obj, err := m.getServedCR(ctx, contextName, istioPeerAuthenticationGR, namespace, name)
+	if err != nil {
+		return nil, err
+	}
+	// A namespace-wide PeerAuthentication has no selector; send {} rather than null.
+	selectorLabels, _, _ := unstructured.NestedStringMap(obj.Object, "spec", "selector", "matchLabels")
+	if selectorLabels == nil {
+		selectorLabels = map[string]string{}
+	}
+	return &IstioPeerAuthenticationDetail{
+		IstioPeerAuthenticationInfo: extractPeerAuthentication(obj),
+		SelectorLabels:              selectorLabels,
+		PortLevel:                   extractPortLevelMTLS(obj),
+	}, nil
+}
+
+func extractPeerAuthentication(obj *unstructured.Unstructured) IstioPeerAuthenticationInfo {
+	mode, _, _ := unstructured.NestedString(obj.Object, "spec", "mtls", "mode")
+	if mode == "" {
+		mode = "UNSET"
+	}
+	selectorLabels, found, _ := unstructured.NestedStringMap(obj.Object, "spec", "selector", "matchLabels")
+	selector := "namespace-wide"
+	if found && len(selectorLabels) > 0 {
+		pairs := make([]string, 0, len(selectorLabels))
+		for k, v := range selectorLabels {
+			pairs = append(pairs, k+"="+v)
+		}
+		sort.Strings(pairs)
+		selector = strings.Join(pairs, ", ")
+	}
+	return IstioPeerAuthenticationInfo{
+		Name:      obj.GetName(),
+		Namespace: obj.GetNamespace(),
+		MTLSMode:  mode,
+		Selector:  selector,
+		CreatedAt: obj.GetCreationTimestamp().UTC().Format(time.RFC3339),
+	}
+}
+
+func extractPortLevelMTLS(obj *unstructured.Unstructured) []IstioPortMTLS {
+	raw, found, _ := nestedMapNoCopy(obj.Object, "spec", "portLevelMtls")
+	if !found {
+		return []IstioPortMTLS{}
+	}
+	out := make([]IstioPortMTLS, 0, len(raw))
+	for portStr, v := range raw {
+		entry, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		mode, _ := entry["mode"].(string)
+		port, err := strconv.ParseInt(portStr, 10, 64)
+		if err != nil {
+			continue
+		}
+		out = append(out, IstioPortMTLS{Port: port, Mode: mode})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Port < out[j].Port })
+	return out
+}

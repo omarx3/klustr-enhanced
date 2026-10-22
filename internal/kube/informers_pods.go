@@ -1,0 +1,1003 @@
+package kube
+
+import (
+	"fmt"
+	"sort"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/tools/cache"
+)
+
+// podByNodeIndex lets PodsOnNode resolve a node's pods through the informer's
+// indexer (O(pods on the node)) instead of scanning the whole pod cache
+// (O(all pods)). The Pod binding wires these indexers in via ensureKind.
+const podByNodeIndex = "klustrPodByNode"
+
+var podIndexers = cache.Indexers{
+	podByNodeIndex: func(obj any) ([]string, error) {
+		pod, ok := obj.(*corev1.Pod)
+		if !ok || pod.Spec.NodeName == "" {
+			return nil, nil
+		}
+		return []string{pod.Spec.NodeName}, nil
+	},
+}
+
+// projectPod is the Pod delta projector: a cached object becomes its
+// "namespace/name" key plus the same PodInfo the list path produces.
+func projectPod(obj any) (string, any, bool) {
+	p, ok := obj.(*corev1.Pod)
+	if !ok {
+		return "", nil, false
+	}
+	return p.Namespace + "/" + p.Name, podInfoFrom(p), true
+}
+
+type PodInfo struct {
+	Name         string              `json:"name"`
+	Namespace    string              `json:"namespace"`
+	Status       string              `json:"status"`
+	Ready        string              `json:"ready"`
+	Restarts     int32               `json:"restarts"`
+	Node         string              `json:"node"`
+	PodIP        string              `json:"podIP"`
+	CreatedAt    string              `json:"createdAt"`
+	CPURequestMC int64               `json:"cpuRequestMC"`
+	CPULimitMC   int64               `json:"cpuLimitMC"`
+	MemRequestB  int64               `json:"memRequestB"`
+	MemLimitB    int64               `json:"memLimitB"`
+	HasPorts     bool                `json:"hasPorts"`
+	Containers   []PodContainerBrief `json:"containers"`
+}
+
+// PodContainerBrief is the per-container summary the Pods list renders as a row
+// of status squares. Regular containers come first, then init containers, so a
+// pod's full makeup (e.g. cilium's one agent container plus several init
+// containers) is visible at a glance without opening the detail panel.
+type PodContainerBrief struct {
+	Name  string `json:"name"`
+	Init  bool   `json:"init"`
+	Tone  string `json:"tone"`  // ready | warn | error | done
+	State string `json:"state"` // human-readable state for the tooltip
+}
+
+type PodLogTarget struct {
+	Pod        string   `json:"pod"`
+	Containers []string `json:"containers"`
+}
+
+type ContainerDetail struct {
+	Name         string             `json:"name"`
+	Image        string             `json:"image"`
+	State        string             `json:"state"`
+	StateReason  string             `json:"stateReason"`
+	Ready        bool               `json:"ready"`
+	RestartCount int32              `json:"restartCount"`
+	StartedAt    string             `json:"startedAt"`
+	LastState    string             `json:"lastState"`
+	Ports        []ContainerPort    `json:"ports"`
+	Env          []ContainerEnvVar  `json:"env"`
+	EnvFrom      []ContainerEnvFrom `json:"envFrom"`
+	// Resources is what the spec asks for; Allocated is what the kubelet has
+	// actually granted (status.containerStatuses[].resources). They diverge
+	// while an in-place resize is still being applied or was Deferred.
+	Resources ContainerResources `json:"resources"`
+	Allocated ContainerResources `json:"allocated"`
+}
+
+type ContainerResources struct {
+	CPURequest string `json:"cpuRequest"`
+	CPULimit   string `json:"cpuLimit"`
+	MemRequest string `json:"memRequest"`
+	MemLimit   string `json:"memLimit"`
+}
+
+func containerResources(rr corev1.ResourceRequirements) ContainerResources {
+	return resourcesFrom(rr.Requests, rr.Limits)
+}
+
+func resourcesFrom(requests, limits corev1.ResourceList) ContainerResources {
+	q := func(list corev1.ResourceList, name corev1.ResourceName) string {
+		if v, ok := list[name]; ok {
+			return v.String()
+		}
+		return ""
+	}
+	return ContainerResources{
+		CPURequest: q(requests, corev1.ResourceCPU),
+		CPULimit:   q(limits, corev1.ResourceCPU),
+		MemRequest: q(requests, corev1.ResourceMemory),
+		MemLimit:   q(limits, corev1.ResourceMemory),
+	}
+}
+
+type ContainerPort struct {
+	Name          string `json:"name"`
+	ContainerPort int32  `json:"containerPort"`
+	Protocol      string `json:"protocol"`
+}
+
+type ContainerEnvVar struct {
+	Name      string     `json:"name"`
+	Value     string     `json:"value"`
+	ValueFrom string     `json:"valueFrom"`
+	Ref       *EnvVarRef `json:"ref,omitempty"`
+}
+
+type ContainerEnvFrom struct {
+	Source string     `json:"source"`
+	Prefix string     `json:"prefix"`
+	Ref    *EnvVarRef `json:"ref,omitempty"`
+}
+
+type EnvVarRef struct {
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+	Key  string `json:"key"`
+}
+
+type PodDetail struct {
+	Name                string            `json:"name"`
+	Namespace           string            `json:"namespace"`
+	UID                 string            `json:"uid"`
+	Status              string            `json:"status"`
+	Phase               string            `json:"phase"`
+	Node                string            `json:"node"`
+	PodIP               string            `json:"podIP"`
+	HostIP              string            `json:"hostIP"`
+	QOSClass            string            `json:"qosClass"`
+	ServiceAccount      string            `json:"serviceAccount"`
+	RestartPolicy       string            `json:"restartPolicy"`
+	PriorityClassName   string            `json:"priorityClassName"`
+	CreatedAt           string            `json:"createdAt"`
+	Labels              map[string]string `json:"labels"`
+	Annotations         map[string]string `json:"annotations"`
+	Owners              []OwnerRef        `json:"owners"`
+	InitContainers      []ContainerDetail `json:"initContainers"`
+	Containers          []ContainerDetail `json:"containers"`
+	EphemeralContainers []ContainerDetail `json:"ephemeralContainers"`
+	Conditions          []ConditionDetail `json:"conditions"`
+	// ResizeStatus reflects an in-flight in-place resize: "Proposed",
+	// "InProgress", "Deferred" or "Infeasible" (empty when none is pending).
+	// Read from .status.resize on older clusters and from the
+	// PodResizePending / PodResizeInProgress conditions on 1.33+.
+	ResizeStatus string `json:"resizeStatus"`
+}
+
+func (w *contextWatcher) Pod(namespace, name string) (*PodDetail, error) {
+	f := w.factoryFor("Pod")
+	if f == nil {
+		return nil, errKindNoAccess("Pod")
+	}
+	p, err := f.Core().V1().Pods().Lister().Pods(namespace).Get(name)
+	if err != nil {
+		return nil, err
+	}
+	owners := make([]OwnerRef, 0, len(p.OwnerReferences))
+	for _, o := range p.OwnerReferences {
+		owners = append(owners, OwnerRef{Kind: o.Kind, Name: o.Name})
+		if o.Kind == "ReplicaSet" {
+			if grandparent := w.replicaSetController(p.Namespace, o.Name); grandparent != nil {
+				owners = append(owners, *grandparent)
+			}
+		}
+	}
+	ephemeralSpecs := make([]corev1.Container, 0, len(p.Spec.EphemeralContainers))
+	for _, ec := range p.Spec.EphemeralContainers {
+		ephemeralSpecs = append(ephemeralSpecs, corev1.Container(ec.EphemeralContainerCommon))
+	}
+	return &PodDetail{
+		Name:                p.Name,
+		Namespace:           p.Namespace,
+		UID:                 string(p.UID),
+		Status:              derivePodStatus(p),
+		Phase:               string(p.Status.Phase),
+		Node:                p.Spec.NodeName,
+		PodIP:               p.Status.PodIP,
+		HostIP:              p.Status.HostIP,
+		QOSClass:            string(p.Status.QOSClass),
+		ServiceAccount:      p.Spec.ServiceAccountName,
+		RestartPolicy:       string(p.Spec.RestartPolicy),
+		PriorityClassName:   p.Spec.PriorityClassName,
+		CreatedAt:           p.CreationTimestamp.UTC().Format(time.RFC3339),
+		Labels:              p.Labels,
+		Annotations:         p.Annotations,
+		Owners:              owners,
+		InitContainers:      w.containerDetails(p, p.Spec.InitContainers, p.Status.InitContainerStatuses),
+		Containers:          w.containerDetails(p, p.Spec.Containers, p.Status.ContainerStatuses),
+		EphemeralContainers: w.containerDetails(p, ephemeralSpecs, p.Status.EphemeralContainerStatuses),
+		Conditions:          podConditions(p.Status.Conditions),
+		ResizeStatus:        podResizeStatus(p),
+	}, nil
+}
+
+// podResizeStatus surfaces an in-flight in-place resize. Kubernetes ≤1.32
+// exposed it as the .status.resize enum; 1.33 moved it to the
+// PodResizePending / PodResizeInProgress conditions, so both are checked.
+func podResizeStatus(p *corev1.Pod) string {
+	if s := string(p.Status.Resize); s != "" {
+		return s
+	}
+	for _, c := range p.Status.Conditions {
+		if c.Status != corev1.ConditionTrue {
+			continue
+		}
+		switch c.Type {
+		case "PodResizeInProgress":
+			return "InProgress"
+		case "PodResizePending":
+			if c.Reason != "" {
+				return c.Reason // "Deferred" or "Infeasible"
+			}
+			return "Pending"
+		}
+	}
+	return ""
+}
+
+// replicaSetController resolves the controller that owns the named ReplicaSet
+// (a Deployment for the common case) so a Pod's "Controlled By" can surface the
+// full Deployment → ReplicaSet → Pod chain. Returns nil when the ReplicaSet is
+// not in the cache or has no controller owner.
+func (w *contextWatcher) replicaSetController(namespace, name string) *OwnerRef {
+	f := w.factoryFor("ReplicaSet")
+	if f == nil {
+		return nil
+	}
+	rs, err := f.Apps().V1().ReplicaSets().Lister().ReplicaSets(namespace).Get(name)
+	if err != nil {
+		return nil
+	}
+	return controllerOwnerRef(rs.OwnerReferences)
+}
+
+func (w *contextWatcher) containerDetails(pod *corev1.Pod, specs []corev1.Container, statuses []corev1.ContainerStatus) []ContainerDetail {
+	byName := make(map[string]corev1.ContainerStatus, len(statuses))
+	for _, s := range statuses {
+		byName[s.Name] = s
+	}
+	out := make([]ContainerDetail, 0, len(specs))
+	for i := range specs {
+		c := &specs[i]
+		ports := make([]ContainerPort, 0, len(c.Ports))
+		for _, p := range c.Ports {
+			proto := string(p.Protocol)
+			if proto == "" {
+				proto = "TCP"
+			}
+			ports = append(ports, ContainerPort{
+				Name:          p.Name,
+				ContainerPort: p.ContainerPort,
+				Protocol:      proto,
+			})
+		}
+		d := ContainerDetail{
+			Name:      c.Name,
+			Image:     c.Image,
+			Ports:     ports,
+			Env:       w.envVarsFrom(pod, c, c.Env),
+			EnvFrom:   envFromSources(c.EnvFrom),
+			Resources: containerResources(c.Resources),
+		}
+		if s, ok := byName[c.Name]; ok {
+			d.Ready = s.Ready
+			d.RestartCount = s.RestartCount
+			if s.Resources != nil {
+				d.Allocated = resourcesFrom(s.Resources.Requests, s.Resources.Limits)
+			}
+			switch {
+			case s.State.Running != nil:
+				d.State = "Running"
+				d.StartedAt = s.State.Running.StartedAt.UTC().Format(time.RFC3339)
+			case s.State.Waiting != nil:
+				d.State = "Waiting"
+				d.StateReason = s.State.Waiting.Reason
+			case s.State.Terminated != nil:
+				d.State = "Terminated"
+				d.StateReason = s.State.Terminated.Reason
+				if s.State.Terminated.Reason == "" {
+					d.StateReason = fmt.Sprintf("ExitCode:%d", s.State.Terminated.ExitCode)
+				}
+				if !s.State.Terminated.StartedAt.IsZero() {
+					d.StartedAt = s.State.Terminated.StartedAt.UTC().Format(time.RFC3339)
+				}
+			}
+			if s.LastTerminationState.Terminated != nil {
+				reason := s.LastTerminationState.Terminated.Reason
+				if reason == "" {
+					reason = fmt.Sprintf("ExitCode:%d", s.LastTerminationState.Terminated.ExitCode)
+				}
+				d.LastState = reason
+			}
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+func (w *contextWatcher) envVarsFrom(pod *corev1.Pod, container *corev1.Container, env []corev1.EnvVar) []ContainerEnvVar {
+	if len(env) == 0 {
+		return []ContainerEnvVar{}
+	}
+	out := make([]ContainerEnvVar, 0, len(env))
+	for _, e := range env {
+		if w.optionalEnvKeyAbsent(pod.Namespace, e.ValueFrom) {
+			continue
+		}
+		v := ContainerEnvVar{Name: e.Name}
+		if e.ValueFrom != nil {
+			v.ValueFrom, v.Ref = describeEnvVarSource(e.ValueFrom)
+			if e.ValueFrom.FieldRef != nil {
+				v.Value = resolveFieldRef(pod, e.ValueFrom.FieldRef.FieldPath)
+			} else if e.ValueFrom.ResourceFieldRef != nil {
+				v.Value = resolveResourceFieldRef(container, e.ValueFrom.ResourceFieldRef)
+			}
+		} else {
+			v.Value = e.Value
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+// optionalEnvKeyAbsent reports whether an env var from an optional
+// ConfigMap/Secret key points at a key the cache confirms is missing; the
+// kubelet never sets such a var, so listing it is noise. Denied or uncached
+// objects return false so nothing that might be set vanishes. Missing required
+// keys are a real CreateContainerConfigError and stay visible.
+func (w *contextWatcher) optionalEnvKeyAbsent(namespace string, src *corev1.EnvVarSource) bool {
+	if src == nil {
+		return false
+	}
+	if ref := src.ConfigMapKeyRef; ref != nil && ref.Optional != nil && *ref.Optional {
+		return w.configMapKeyConfirmedAbsent(namespace, ref.Name, ref.Key)
+	}
+	if ref := src.SecretKeyRef; ref != nil && ref.Optional != nil && *ref.Optional {
+		return w.secretKeyConfirmedAbsent(namespace, ref.Name, ref.Key)
+	}
+	return false
+}
+
+func (w *contextWatcher) configMapKeyConfirmedAbsent(namespace, name, key string) bool {
+	f := w.factoryFor("ConfigMap")
+	if f == nil {
+		return false
+	}
+	cm, err := f.Core().V1().ConfigMaps().Lister().ConfigMaps(namespace).Get(name)
+	if err != nil {
+		return false
+	}
+	if _, ok := cm.Data[key]; ok {
+		return false
+	}
+	_, ok := cm.BinaryData[key]
+	return !ok
+}
+
+func (w *contextWatcher) secretKeyConfirmedAbsent(namespace, name, key string) bool {
+	f := w.factoryFor("Secret")
+	if f == nil {
+		return false
+	}
+	s, err := f.Core().V1().Secrets().Lister().Secrets(namespace).Get(name)
+	if err != nil {
+		return false
+	}
+	_, ok := s.Data[key]
+	return !ok
+}
+
+func describeEnvVarSource(src *corev1.EnvVarSource) (string, *EnvVarRef) {
+	switch {
+	case src.ConfigMapKeyRef != nil:
+		return fmt.Sprintf("ConfigMap: %s/%s", src.ConfigMapKeyRef.Name, src.ConfigMapKeyRef.Key),
+			&EnvVarRef{Kind: "ConfigMap", Name: src.ConfigMapKeyRef.Name, Key: src.ConfigMapKeyRef.Key}
+	case src.SecretKeyRef != nil:
+		return fmt.Sprintf("Secret: %s/%s", src.SecretKeyRef.Name, src.SecretKeyRef.Key),
+			&EnvVarRef{Kind: "Secret", Name: src.SecretKeyRef.Name, Key: src.SecretKeyRef.Key}
+	case src.FieldRef != nil:
+		return "field: " + src.FieldRef.FieldPath, nil
+	case src.ResourceFieldRef != nil:
+		return "resource: " + src.ResourceFieldRef.Resource, nil
+	}
+	return "", nil
+}
+
+func resolveFieldRef(pod *corev1.Pod, fieldPath string) string {
+	if pod == nil {
+		return ""
+	}
+	switch fieldPath {
+	case "metadata.name":
+		return pod.Name
+	case "metadata.namespace":
+		return pod.Namespace
+	case "metadata.uid":
+		return string(pod.UID)
+	case "spec.nodeName":
+		return pod.Spec.NodeName
+	case "spec.serviceAccountName":
+		return pod.Spec.ServiceAccountName
+	case "status.hostIP":
+		return pod.Status.HostIP
+	case "status.podIP":
+		return pod.Status.PodIP
+	case "status.phase":
+		return string(pod.Status.Phase)
+	}
+	return ""
+}
+
+func resolveResourceFieldRef(container *corev1.Container, src *corev1.ResourceFieldSelector) string {
+	if container == nil {
+		return ""
+	}
+	get := func(rl corev1.ResourceList, name corev1.ResourceName) (string, bool) {
+		if q, ok := rl[name]; ok {
+			return q.String(), true
+		}
+		return "", false
+	}
+	switch src.Resource {
+	case "limits.cpu":
+		if v, ok := get(container.Resources.Limits, corev1.ResourceCPU); ok {
+			return v
+		}
+	case "limits.memory":
+		if v, ok := get(container.Resources.Limits, corev1.ResourceMemory); ok {
+			return v
+		}
+	case "limits.ephemeral-storage":
+		if v, ok := get(container.Resources.Limits, corev1.ResourceEphemeralStorage); ok {
+			return v
+		}
+	case "requests.cpu":
+		if v, ok := get(container.Resources.Requests, corev1.ResourceCPU); ok {
+			return v
+		}
+	case "requests.memory":
+		if v, ok := get(container.Resources.Requests, corev1.ResourceMemory); ok {
+			return v
+		}
+	case "requests.ephemeral-storage":
+		if v, ok := get(container.Resources.Requests, corev1.ResourceEphemeralStorage); ok {
+			return v
+		}
+	}
+	return ""
+}
+
+func envFromSources(sources []corev1.EnvFromSource) []ContainerEnvFrom {
+	if len(sources) == 0 {
+		return []ContainerEnvFrom{}
+	}
+	out := make([]ContainerEnvFrom, 0, len(sources))
+	for _, s := range sources {
+		entry := ContainerEnvFrom{Prefix: s.Prefix}
+		switch {
+		case s.ConfigMapRef != nil:
+			entry.Source = "ConfigMap: " + s.ConfigMapRef.Name
+			entry.Ref = &EnvVarRef{Kind: "ConfigMap", Name: s.ConfigMapRef.Name}
+		case s.SecretRef != nil:
+			entry.Source = "Secret: " + s.SecretRef.Name
+			entry.Ref = &EnvVarRef{Kind: "Secret", Name: s.SecretRef.Name}
+		default:
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func podConditions(conds []corev1.PodCondition) []ConditionDetail {
+	out := make([]ConditionDetail, 0, len(conds))
+	for _, c := range conds {
+		out = append(out, ConditionDetail{
+			Type:    string(c.Type),
+			Status:  string(c.Status),
+			Reason:  c.Reason,
+			Message: c.Message,
+		})
+	}
+	return out
+}
+
+func (w *contextWatcher) PodLogTargets(namespace string, selector map[string]string) []PodLogTarget {
+	if len(selector) == 0 {
+		return []PodLogTarget{}
+	}
+	f := w.factoryFor("Pod")
+	if f == nil {
+		return []PodLogTarget{}
+	}
+	sel := labels.SelectorFromSet(labels.Set(selector))
+	lister := f.Core().V1().Pods().Lister()
+	var (
+		pods []*corev1.Pod
+		err  error
+	)
+	if namespace == "" {
+		pods, err = lister.List(sel)
+	} else {
+		pods, err = lister.Pods(namespace).List(sel)
+	}
+	if err != nil {
+		return []PodLogTarget{}
+	}
+	out := make([]PodLogTarget, 0, len(pods))
+	for _, p := range pods {
+		containers := make([]string, 0, len(p.Spec.Containers))
+		for _, c := range p.Spec.Containers {
+			containers = append(containers, c.Name)
+		}
+		out = append(out, PodLogTarget{Pod: p.Name, Containers: containers})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Pod < out[j].Pod })
+	return out
+}
+
+func (w *contextWatcher) Pods(namespace string) []PodInfo {
+	f := w.factoryFor("Pod")
+	if f == nil {
+		return []PodInfo{}
+	}
+	lister := f.Core().V1().Pods().Lister()
+	var (
+		pods []*corev1.Pod
+		err  error
+	)
+	if namespace == "" {
+		pods, err = lister.List(labels.Everything())
+	} else {
+		pods, err = lister.Pods(namespace).List(labels.Everything())
+	}
+	if err != nil {
+		return []PodInfo{}
+	}
+	return podInfosFrom(pods)
+}
+
+// PodsOnNode returns pods scheduled on the given node, across all namespaces.
+func (w *contextWatcher) PodsOnNode(nodeName string) []PodInfo {
+	if nodeName == "" {
+		return []PodInfo{}
+	}
+	f := w.factoryFor("Pod")
+	if f == nil {
+		return []PodInfo{}
+	}
+	indexer := f.Core().V1().Pods().Informer().GetIndexer()
+	if objs, err := indexer.ByIndex(podByNodeIndex, nodeName); err == nil {
+		matched := make([]*corev1.Pod, 0, len(objs))
+		for _, o := range objs {
+			if p, ok := o.(*corev1.Pod); ok {
+				matched = append(matched, p)
+			}
+		}
+		return podInfosFrom(matched)
+	}
+	// Fall back to a full scan if the index isn't registered, so node detail
+	// stays correct even if indexer wiring was skipped.
+	all, err := f.Core().V1().Pods().Lister().List(labels.Everything())
+	if err != nil {
+		return []PodInfo{}
+	}
+	matched := make([]*corev1.Pod, 0, len(all))
+	for _, p := range all {
+		if p.Spec.NodeName == nodeName {
+			matched = append(matched, p)
+		}
+	}
+	return podInfosFrom(matched)
+}
+
+// PodsForOwner dispatches by kind: for Node it returns pods scheduled on
+// that node, for workload kinds it looks up the workload's selector via the
+// local lister and returns matching pods.
+func (w *contextWatcher) PodsForOwner(kind, namespace, name string) ([]PodInfo, error) {
+	switch kind {
+	case "Node":
+		return w.PodsOnNode(name), nil
+	case "Deployment":
+		f := w.factoryFor("Deployment")
+		if f == nil {
+			return nil, errKindNoAccess("Deployment")
+		}
+		d, err := f.Apps().V1().Deployments().Lister().Deployments(namespace).Get(name)
+		if err != nil {
+			return nil, err
+		}
+		return w.PodsForSelector(namespace, d.Spec.Selector), nil
+	case "StatefulSet":
+		f := w.factoryFor("StatefulSet")
+		if f == nil {
+			return nil, errKindNoAccess("StatefulSet")
+		}
+		s, err := f.Apps().V1().StatefulSets().Lister().StatefulSets(namespace).Get(name)
+		if err != nil {
+			return nil, err
+		}
+		return w.PodsForSelector(namespace, s.Spec.Selector), nil
+	case "DaemonSet":
+		f := w.factoryFor("DaemonSet")
+		if f == nil {
+			return nil, errKindNoAccess("DaemonSet")
+		}
+		d, err := f.Apps().V1().DaemonSets().Lister().DaemonSets(namespace).Get(name)
+		if err != nil {
+			return nil, err
+		}
+		return w.PodsForSelector(namespace, d.Spec.Selector), nil
+	case "ReplicaSet":
+		f := w.factoryFor("ReplicaSet")
+		if f == nil {
+			return nil, errKindNoAccess("ReplicaSet")
+		}
+		r, err := f.Apps().V1().ReplicaSets().Lister().ReplicaSets(namespace).Get(name)
+		if err != nil {
+			return nil, err
+		}
+		return w.PodsForSelector(namespace, r.Spec.Selector), nil
+	case "Job":
+		f := w.factoryFor("Job")
+		if f == nil {
+			return nil, errKindNoAccess("Job")
+		}
+		j, err := f.Batch().V1().Jobs().Lister().Jobs(namespace).Get(name)
+		if err != nil {
+			return nil, err
+		}
+		// The Job controller generates a selector on the job's controller-uid,
+		// so it matches this job's pods only, never another run's.
+		return w.PodsForSelector(namespace, j.Spec.Selector), nil
+	default:
+		return nil, fmt.Errorf("PodsForOwner: unsupported kind %q", kind)
+	}
+}
+
+// PodsForSelector returns pods in the given namespace matching the selector.
+// An empty selector returns no pods (a nil/empty selector would otherwise
+// match every pod in the namespace, which is never what the caller wants).
+func (w *contextWatcher) PodsForSelector(namespace string, sel *metav1.LabelSelector) []PodInfo {
+	if sel == nil || (len(sel.MatchLabels) == 0 && len(sel.MatchExpressions) == 0) {
+		return []PodInfo{}
+	}
+	selector, err := metav1.LabelSelectorAsSelector(sel)
+	if err != nil {
+		return []PodInfo{}
+	}
+	f := w.factoryFor("Pod")
+	if f == nil {
+		return []PodInfo{}
+	}
+	lister := f.Core().V1().Pods().Lister()
+	var (
+		pods    []*corev1.Pod
+		listErr error
+	)
+	if namespace == "" {
+		pods, listErr = lister.List(selector)
+	} else {
+		pods, listErr = lister.Pods(namespace).List(selector)
+	}
+	if listErr != nil {
+		return []PodInfo{}
+	}
+	return podInfosFrom(pods)
+}
+
+func podInfosFrom(pods []*corev1.Pod) []PodInfo {
+	out := make([]PodInfo, 0, len(pods))
+	for _, p := range pods {
+		out = append(out, podInfoFrom(p))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Namespace != out[j].Namespace {
+			return out[i].Namespace < out[j].Namespace
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+func podInfoFrom(p *corev1.Pod) PodInfo {
+	ready, total := 0, len(p.Spec.Containers)
+	var restarts int32
+	for _, cs := range p.Status.ContainerStatuses {
+		if cs.Ready {
+			ready++
+		}
+		restarts += cs.RestartCount
+	}
+	// Fold in init/sidecar restarts the way kubectl's RESTARTS column does, so a
+	// crash-looping init container or a restarting native sidecar isn't hidden
+	// as 0. The Ready count/denominator stays over regular containers only.
+	for _, cs := range p.Status.InitContainerStatuses {
+		restarts += cs.RestartCount
+	}
+	cpuReq, cpuLim, memReq, memLim := podResourceTotals(p)
+	hasPorts := false
+	for _, c := range p.Spec.Containers {
+		if len(c.Ports) > 0 {
+			hasPorts = true
+			break
+		}
+	}
+	return PodInfo{
+		Name:         p.Name,
+		Namespace:    p.Namespace,
+		Status:       derivePodStatus(p),
+		Ready:        fmt.Sprintf("%d/%d", ready, total),
+		Restarts:     restarts,
+		Node:         p.Spec.NodeName,
+		PodIP:        p.Status.PodIP,
+		CreatedAt:    p.CreationTimestamp.UTC().Format(time.RFC3339),
+		CPURequestMC: cpuReq,
+		CPULimitMC:   cpuLim,
+		MemRequestB:  memReq,
+		MemLimitB:    memLim,
+		HasPorts:     hasPorts,
+		Containers:   podContainerBriefs(p),
+	}
+}
+
+// podContainerBriefs summarizes every container's status for the Pods list,
+// regular containers first then init containers so the row of squares reads as
+// "app health, then the init chain behind it".
+func podContainerBriefs(p *corev1.Pod) []PodContainerBrief {
+	regStatus := make(map[string]corev1.ContainerStatus, len(p.Status.ContainerStatuses))
+	for _, s := range p.Status.ContainerStatuses {
+		regStatus[s.Name] = s
+	}
+	initStatus := make(map[string]corev1.ContainerStatus, len(p.Status.InitContainerStatuses))
+	for _, s := range p.Status.InitContainerStatuses {
+		initStatus[s.Name] = s
+	}
+	out := make([]PodContainerBrief, 0, len(p.Spec.Containers)+len(p.Spec.InitContainers))
+	for _, c := range p.Spec.Containers {
+		out = append(out, containerBrief(c.Name, lookupStatus(regStatus, c.Name), false))
+	}
+	for _, c := range p.Spec.InitContainers {
+		out = append(out, containerBrief(c.Name, lookupStatus(initStatus, c.Name), true))
+	}
+	return out
+}
+
+func lookupStatus(byName map[string]corev1.ContainerStatus, name string) *corev1.ContainerStatus {
+	if s, ok := byName[name]; ok {
+		return &s
+	}
+	return nil
+}
+
+func containerBrief(name string, st *corev1.ContainerStatus, init bool) PodContainerBrief {
+	b := PodContainerBrief{Name: name, Init: init}
+	switch {
+	case st == nil:
+		b.Tone, b.State = "warn", "Pending"
+	case st.State.Waiting != nil:
+		b.State = st.State.Waiting.Reason
+		if b.State == "" {
+			b.State = "Waiting"
+		}
+		if isFailureReason(b.State) {
+			b.Tone = "error"
+		} else {
+			b.Tone = "warn"
+		}
+	case st.State.Terminated != nil:
+		t := st.State.Terminated
+		if t.ExitCode == 0 {
+			b.Tone, b.State = "done", "Completed"
+		} else {
+			b.Tone = "error"
+			b.State = t.Reason
+			if b.State == "" {
+				b.State = fmt.Sprintf("ExitCode:%d", t.ExitCode)
+			}
+		}
+	case st.State.Running != nil:
+		if st.Ready {
+			b.Tone, b.State = "ready", "Running"
+		} else {
+			b.Tone, b.State = "warn", "Running"
+		}
+	default:
+		b.Tone, b.State = "warn", "Unknown"
+	}
+	return b
+}
+
+func isFailureReason(reason string) bool {
+	switch reason {
+	case "CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "InvalidImageName",
+		"CreateContainerConfigError", "CreateContainerError", "RunContainerError",
+		"ErrImageNeverPull", "ImageInspectError":
+		return true
+	}
+	return false
+}
+
+// podResourceTotals returns a pod's effective cpu (millicores) and memory
+// (bytes) requests and limits per Kubernetes scheduling semantics: regular and
+// sidecar containers sum; an ordinary init container only raises the total
+// when it plus the sidecars started before it exceeds that sum. Zero is unset.
+// A limit is unset as soon as one container (init included) leaves it out,
+// as the kubelet then leaves the pod cgroup unbounded; summing the rest would
+// show a cap the pod does not have.
+func podResourceTotals(p *corev1.Pod) (cpuReq, cpuLim, memReq, memLim int64) {
+	type res struct{ cpuReq, cpuLim, memReq, memLim int64 }
+	cpuUnbounded, memUnbounded := false, false
+	get := func(c corev1.Container) res {
+		var r res
+		if q, ok := c.Resources.Requests[corev1.ResourceCPU]; ok {
+			r.cpuReq = q.MilliValue()
+		}
+		if q, ok := c.Resources.Limits[corev1.ResourceCPU]; ok && !q.IsZero() {
+			r.cpuLim = q.MilliValue()
+		} else {
+			cpuUnbounded = true
+		}
+		if q, ok := c.Resources.Requests[corev1.ResourceMemory]; ok {
+			r.memReq = q.Value()
+		}
+		if q, ok := c.Resources.Limits[corev1.ResourceMemory]; ok && !q.IsZero() {
+			r.memLim = q.Value()
+		} else {
+			memUnbounded = true
+		}
+		return r
+	}
+
+	var base, sidecar, initMax res
+	for _, c := range p.Spec.Containers {
+		r := get(c)
+		base.cpuReq += r.cpuReq
+		base.cpuLim += r.cpuLim
+		base.memReq += r.memReq
+		base.memLim += r.memLim
+	}
+	for _, c := range p.Spec.InitContainers {
+		r := get(c)
+		if c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways {
+			sidecar.cpuReq += r.cpuReq
+			sidecar.cpuLim += r.cpuLim
+			sidecar.memReq += r.memReq
+			sidecar.memLim += r.memLim
+			base.cpuReq += r.cpuReq
+			base.cpuLim += r.cpuLim
+			base.memReq += r.memReq
+			base.memLim += r.memLim
+		} else {
+			initMax.cpuReq = max(initMax.cpuReq, sidecar.cpuReq+r.cpuReq)
+			initMax.cpuLim = max(initMax.cpuLim, sidecar.cpuLim+r.cpuLim)
+			initMax.memReq = max(initMax.memReq, sidecar.memReq+r.memReq)
+			initMax.memLim = max(initMax.memLim, sidecar.memLim+r.memLim)
+		}
+	}
+	cpuLim, memLim = max(base.cpuLim, initMax.cpuLim), max(base.memLim, initMax.memLim)
+	if cpuUnbounded {
+		cpuLim = 0
+	}
+	if memUnbounded {
+		memLim = 0
+	}
+	return max(base.cpuReq, initMax.cpuReq), cpuLim, max(base.memReq, initMax.memReq), memLim
+}
+
+// initRestartsAlways reports whether the named init container is a native
+// sidecar (RestartPolicy: Always). Matched by name rather than index so it does
+// not assume the status slice and the spec slice share an order.
+func initRestartsAlways(p *corev1.Pod, name string) bool {
+	for i := range p.Spec.InitContainers {
+		if p.Spec.InitContainers[i].Name == name {
+			rp := p.Spec.InitContainers[i].RestartPolicy
+			return rp != nil && *rp == corev1.ContainerRestartPolicyAlways
+		}
+	}
+	return false
+}
+
+// derivePodStatus mirrors kubectl's STATUS column logic: it walks init
+// then regular container states to surface CrashLoopBackOff,
+// ImagePullBackOff, ContainerCreating, Completed, OOMKilled, Init:Reason
+// etc. instead of the coarse Pod.Status.Phase.
+func derivePodStatus(p *corev1.Pod) string {
+	if p.DeletionTimestamp != nil {
+		// A pod on an unreachable node is marked for deletion with
+		// Status.Reason=NodeLost (node.NodeUnreachablePodReason); kubectl shows
+		// "Unknown" for that, so a lost-node orphan reads differently from a
+		// graceful delete instead of both showing "Terminating".
+		if p.Status.Reason == "NodeLost" {
+			return "Unknown"
+		}
+		// kubectl only overrides with "Terminating" while the phase is
+		// non-terminal. A Failed/Succeeded pod stuck deleting behind a finalizer
+		// keeps showing its real reason (Error/OOMKilled/Completed) instead of
+		// hiding it as "Terminating" — the state someone is investigating.
+		if p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed {
+			return "Terminating"
+		}
+	}
+
+	for i, init := range p.Status.InitContainerStatuses {
+		switch {
+		case init.State.Terminated != nil && init.State.Terminated.ExitCode == 0:
+			continue
+		case init.State.Terminated != nil:
+			if init.State.Terminated.Reason != "" {
+				return "Init:" + init.State.Terminated.Reason
+			}
+			if init.State.Terminated.Signal != 0 {
+				return fmt.Sprintf("Init:Signal:%d", init.State.Terminated.Signal)
+			}
+			return fmt.Sprintf("Init:ExitCode:%d", init.State.Terminated.ExitCode)
+		case init.State.Waiting != nil && init.State.Waiting.Reason != "" && init.State.Waiting.Reason != "PodInitializing":
+			return "Init:" + init.State.Waiting.Reason
+		case initRestartsAlways(p, init.Name) && init.Started != nil && *init.Started:
+			// A native sidecar (restartable init container) never terminates;
+			// once started it stays Running, so without this it would pin the
+			// status at Init:i/N for the pod's whole life. kubectl skips it.
+			continue
+		default:
+			return fmt.Sprintf("Init:%d/%d", i, len(p.Spec.InitContainers))
+		}
+	}
+
+	reason := ""
+	hasRunning := false
+	for i := len(p.Status.ContainerStatuses) - 1; i >= 0; i-- {
+		c := p.Status.ContainerStatuses[i]
+		switch {
+		case c.State.Waiting != nil && c.State.Waiting.Reason != "":
+			reason = c.State.Waiting.Reason
+		case c.State.Terminated != nil && c.State.Terminated.Reason != "":
+			reason = c.State.Terminated.Reason
+		case c.State.Terminated != nil && c.State.Terminated.Signal != 0:
+			reason = fmt.Sprintf("Signal:%d", c.State.Terminated.Signal)
+		case c.State.Terminated != nil:
+			reason = fmt.Sprintf("ExitCode:%d", c.State.Terminated.ExitCode)
+		case c.Ready && c.State.Running != nil:
+			hasRunning = true
+		}
+	}
+
+	// A terminated container (commonly a Completed sidecar) must not mask
+	// containers still running, matching kubectl's printer.
+	if reason == "Completed" && hasRunning {
+		if podReady(p) {
+			reason = "Running"
+		} else {
+			reason = "NotReady"
+		}
+	}
+
+	if reason != "" {
+		return reason
+	}
+	if p.Status.Reason != "" {
+		return p.Status.Reason
+	}
+	// A pod held by a scheduling gate has no container statuses, so it would
+	// otherwise read as a bare "Pending"; kubectl surfaces the gate.
+	if p.Status.Phase == corev1.PodPending {
+		for _, c := range p.Status.Conditions {
+			if c.Type == corev1.PodScheduled && c.Reason == "SchedulingGated" {
+				return "SchedulingGated"
+			}
+		}
+	}
+	return string(p.Status.Phase)
+}
+
+func podReady(p *corev1.Pod) bool {
+	for _, c := range p.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}

@@ -1,0 +1,202 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  # release.yml gates its build on this, so a tag runs the same checks main
+  # does rather than trusting that it points at a commit CI already saw.
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Docs-only changes skip the jobs below. A job skipped by its `if` reports
+  # success, so the required checks still pass, where a workflow-level paths
+  # filter would leave them unreported and the PR unmergeable. The jobs test
+  # !cancelled() so that a failure here runs them instead of skipping them
+  # into a pass.
+  changes:
+    name: Changes
+    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          # A pull_request run checks out the merge commit, whose first parent
+          # is the base branch tip, so HEAD^1..HEAD is the whole PR rather than
+          # its latest push.
+          fetch-depth: 2
+
+      - name: Diff against the base
+        id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          # Same set as paths-ignore in codeql.yml. No job builds, tests or
+          # lints anything in it.
+          docs_only='^(docs/|\.github/ISSUE_TEMPLATE/)|\.md$'
+          base=
+          if [[ $EVENT == pull_request ]]; then
+            base=HEAD^1
+          elif [[ $EVENT == push && $REF == refs/heads/main && ! $BEFORE =~ ^0*$ ]] &&
+            git fetch --no-tags --depth=1 origin "$BEFORE"; then
+            base=$BEFORE
+          fi
+          # Tags, the release.yml call, manual runs and anything that can't be
+          # diffed run everything.
+          code=true
+          changed=
+          if [[ -n $base ]] && changed=$(git diff --no-renames --name-only "$base" HEAD) &&
+            [[ -n $changed ]] && ! grep -qvE "$docs_only" <<<"$changed"; then
+            code=false
+          fi
+          printf '%s\n' "$changed"
+          echo "code=$code" | tee -a "$GITHUB_OUTPUT"
+
+  backend:
+    name: Backend (Go)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - uses: ./.github/actions/linux-build-deps
+
+      # main.go embeds frontend/dist via go:embed; static analysis (vet/test/
+      # lint) doesn't need the real bundle, so stub a placeholder so the root
+      # package compiles without a full frontend build.
+      - name: Stub embedded frontend assets
+        run: mkdir -p frontend/dist && touch frontend/dist/index.html
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+      # The concurrent code — informers, log streams, exec sessions, the
+      # port-forward registry, the credential refresh timer — all lives under
+      # internal, and -race costs 2-3x runtime.
+      - name: go test -race
+        run: go test -race ./internal/...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
+        with:
+          version: v2.12.2
+
+  # The ConPTY terminal is Windows-only code the Linux job never compiles.
+  windows:
+    name: Backend (Go, Windows)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    timeout-minutes: 20
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: go vet
+        run: go vet ./internal/...
+
+      # Scoped to the terminal: the rest of the kube suite builds Unix
+      # ':'-separated PATH lists.
+      - name: go test (terminal)
+        run: go test -run "ConPTY|Terminal|WindowsShell|LoginShell|EnvKey|WindowsExec|WindowsLaunch|NewConsole|Sweep|WSLEnv" ./internal/kube/
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
+        with:
+          version: v2.12.2
+          args: ./internal/...
+
+  vulncheck:
+    name: Vulnerabilities (Go)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - uses: ./.github/actions/linux-build-deps
+
+      - name: Stub embedded frontend assets
+        run: mkdir -p frontend/dist && touch frontend/dist/index.html
+
+      # govulncheck reports a CVE only when the call graph actually reaches the
+      # vulnerable symbol, so a finding is worth acting on. It reports rather
+      # than blocks: an upstream CVE should not hold a release hostage.
+      - name: govulncheck
+        continue-on-error: true
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  frontend:
+    name: Frontend (TypeScript)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    timeout-minutes: 15
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      # tsc --noEmit says nothing about whether rollup can resolve and chunk
+      # the bundle. Keep this after Lint, whose check:api runs before the
+      # build regenerates the bindings.
+      - name: Build
+        run: npm run build

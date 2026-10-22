@@ -1,0 +1,269 @@
+// Pure declarative types and constants for the UI store. Lives in its own
+// file so persistence helpers can reference these without pulling the whole
+// Zustand store and its DOM side effects into their dependency graph.
+
+import type { IntegrationView } from '@/lib/integrationCatalog.generated'
+
+export type SidebarMode = 'expanded' | 'icons'
+
+export const DETAIL_WIDTH_DEFAULT = 560
+export const DETAIL_WIDTH_MIN = 480
+export const DETAIL_WIDTH_MAX = 960
+
+export const SIDEBAR_WIDTH_MIN = 200
+export const SIDEBAR_WIDTH_MAX = 400
+export const SIDEBAR_WIDTH_DEFAULT = 256
+
+export type ContextTag = string
+
+export type ContextHealth = {
+  status: 'pinging' | 'ok' | 'slow' | 'stale' | 'error'
+  latencyMs: number
+  error: string | null
+  version: string | null
+  lastPingAt: number
+  failures: number
+}
+
+export type TagColor =
+  | 'rose'
+  | 'red'
+  | 'orange'
+  | 'amber'
+  | 'yellow'
+  | 'lime'
+  | 'emerald'
+  | 'teal'
+  | 'cyan'
+  | 'sky'
+  | 'blue'
+  | 'indigo'
+  | 'violet'
+  | 'fuchsia'
+  | 'pink'
+  | 'slate'
+
+export type CustomTagDef = {
+  id: string
+  label: string
+  shortLabel: string
+  color: TagColor
+}
+
+export type ContextGroup = {
+  id: string
+  name: string
+  contexts: string[]
+  color: TagColor
+}
+
+export type LastSession = {
+  contexts: string[]
+  groupId: string | null
+  at: number
+}
+
+export const MAX_TAGS_PER_CONTEXT = 3
+
+// Integration views come from the generated catalog; the rest are built-in
+// kinds, Helm and Gateway API.
+export type ResourceView =
+  | IntegrationView
+  | 'overview'
+  | 'workloadsoverview'
+  | 'pods'
+  | 'deployments'
+  | 'services'
+  | 'configmaps'
+  | 'secrets'
+  | 'statefulsets'
+  | 'daemonsets'
+  | 'replicasets'
+  | 'persistentvolumeclaims'
+  | 'persistentvolumes'
+  | 'storageclasses'
+  | 'csidrivers'
+  | 'csinodes'
+  | 'volumeattachments'
+  | 'flowschemas'
+  | 'prioritylevelconfigurations'
+  | 'networkpolicies'
+  | 'horizontalpodautoscalers'
+  | 'poddisruptionbudgets'
+  | 'endpointslices'
+  | 'resourcequotas'
+  | 'limitranges'
+  | 'ingressclasses'
+  | 'priorityclasses'
+  | 'runtimeclasses'
+  | 'leases'
+  | 'mutatingwebhookconfigurations'
+  | 'validatingwebhookconfigurations'
+  | 'validatingadmissionpolicies'
+  | 'validatingadmissionpolicybindings'
+  | 'mutatingadmissionpolicies'
+  | 'mutatingadmissionpolicybindings'
+  | 'deviceclasses'
+  | 'resourceslices'
+  | 'resourceclaims'
+  | 'resourceclaimtemplates'
+  | 'servicecidrs'
+  | 'ipaddresses'
+  | 'apiservices'
+  | 'endpoints'
+  | 'replicationcontrollers'
+  | 'events'
+  | 'jobs'
+  | 'cronjobs'
+  | 'ingresses'
+  | 'nodes'
+  | 'namespaces'
+  | 'serviceaccounts'
+  | 'roles'
+  | 'rolebindings'
+  | 'clusterroles'
+  | 'clusterrolebindings'
+  | 'certificatesigningrequests'
+  | 'accessreview'
+  | 'helmreleases'
+  | 'helmrepos'
+  | 'gateways'
+  | 'httproutes'
+  | 'grpcroutes'
+  | 'tlsroutes'
+  | 'tcproutes'
+  | 'udproutes'
+  | 'listenersets'
+  | 'backendtlspolicies'
+  | 'gatewayclasses'
+  | 'referencegrants'
+
+export type ResourceKind =
+  | 'Pod'
+  | 'Deployment'
+  | 'StatefulSet'
+  | 'DaemonSet'
+  | 'ReplicaSet'
+  | 'PersistentVolumeClaim'
+  | 'PersistentVolume'
+  | 'StorageClass'
+  | 'CSIDriver'
+  | 'CSINode'
+  | 'VolumeAttachment'
+  | 'FlowSchema'
+  | 'PriorityLevelConfiguration'
+  | 'NetworkPolicy'
+  | 'HorizontalPodAutoscaler'
+  | 'PodDisruptionBudget'
+  | 'EndpointSlice'
+  | 'ResourceQuota'
+  | 'LimitRange'
+  | 'IngressClass'
+  | 'PriorityClass'
+  | 'RuntimeClass'
+  | 'Lease'
+  | 'MutatingWebhookConfiguration'
+  | 'ValidatingWebhookConfiguration'
+  | 'ValidatingAdmissionPolicy'
+  | 'ValidatingAdmissionPolicyBinding'
+  | 'MutatingAdmissionPolicy'
+  | 'MutatingAdmissionPolicyBinding'
+  | 'DeviceClass'
+  | 'ResourceSlice'
+  | 'ResourceClaim'
+  | 'ResourceClaimTemplate'
+  | 'ServiceCIDR'
+  | 'IPAddress'
+  | 'APIService'
+  | 'Endpoints'
+  | 'ReplicationController'
+  | 'Job'
+  | 'CronJob'
+  | 'Service'
+  | 'ConfigMap'
+  | 'Secret'
+  | 'Ingress'
+  | 'Node'
+  | 'Namespace'
+  | 'ServiceAccount'
+  | 'Role'
+  | 'RoleBinding'
+  | 'ClusterRole'
+  | 'ClusterRoleBinding'
+  | 'CertificateSigningRequest'
+  | 'Gateway'
+  | 'HTTPRoute'
+  | 'GRPCRoute'
+  | 'TLSRoute'
+  | 'TCPRoute'
+  | 'UDPRoute'
+  | 'ListenerSet'
+  | 'BackendTLSPolicy'
+  | 'GatewayClass'
+  | 'ReferenceGrant'
+
+export type SelectedResourceGVR = {
+  group: string
+  version: string
+  resource: string
+}
+
+export type SelectedResource = {
+  kind: ResourceKind | string
+  namespace: string
+  name: string
+  gvr?: SelectedResourceGVR
+  context?: string
+  // suspended carries the Flux .spec.suspend snapshot from the row click so
+  // the detail dialog's Suspend/Resume button knows which label to render
+  // without having to wait for the body to fetch the full detail object.
+  suspended?: boolean
+  // logContainer preselects a container in the Pod Logs tab when the pod is
+  // opened from a per-container affordance (e.g. the Pods list container
+  // squares), so the click lands straight on that container's stream.
+  logContainer?: string
+}
+
+export type DetailTab =
+  | 'overview'
+  | 'logs'
+  | 'exec'
+  | 'shell'
+  | 'events'
+  | 'history'
+  | 'values'
+  | 'manifest'
+  | 'notes'
+  | 'policy'
+  | 'disruption'
+  | 'resources'
+  | 'nodes'
+  | 'requests'
+  | 'orders'
+  | 'challenges'
+  | 'runs'
+  | 'jobs'
+  | 'violations'
+  | 'yaml'
+
+// A tab in the strip above the workspace: a resource view or a CRD list.
+export type ViewTab = { kind: 'view'; view: ResourceView } | { kind: 'crd'; key: string }
+
+// 'vertical' puts the panes side by side (a vertical divider), 'horizontal'
+// stacks them (a horizontal divider).
+export type SplitDirection = 'vertical' | 'horizontal'
+export type SplitView = { tab: ViewTab; direction: SplitDirection; ratio: number }
+export type Pane = 'primary' | 'secondary'
+
+export type ResourceHistoryEntry = {
+  resource: SelectedResource
+  tab: DetailTab | null
+}
+
+export type PendingAction =
+  | { kind: 'delete'; resource: SelectedResource }
+  | { kind: 'portforward'; resource: SelectedResource }
+  | { kind: 'service-portforward'; resource: SelectedResource }
+  | { kind: 'restart'; resource: SelectedResource }
+  | { kind: 'scale'; resource: SelectedResource }
+  | { kind: 'duplicate'; resource: SelectedResource }

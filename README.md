@@ -1,0 +1,265 @@
+<p align="center">
+  <img src="build/appicon.png" width="128" alt="Klustr">
+</p>
+
+<h1 align="center">Klustr</h1>
+
+<p align="center">
+  A native Kubernetes desktop client that installs <strong>nothing</strong> in your cluster.
+</p>
+
+<p align="center">
+  <a href="LICENSE">
+    <img src="https://img.shields.io/github/license/SametKUM/klustr?style=flat-square&cacheSeconds=300" alt="License">
+  </a>
+  <a href="https://app.fossa.com/projects/git%2Bgithub.com%2FSametKUM%2Fklustr?ref=badge_shield">
+    <img src="https://app.fossa.com/api/projects/git%2Bgithub.com%2FSametKUM%2Fklustr.svg?type=shield" alt="FOSSA Status">
+  </a>
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-blue?style=flat-square&cacheSeconds=300" alt="Platforms">
+  <a href="https://github.com/SametKUM/klustr/releases/latest">
+    <img src="https://img.shields.io/github/v/release/SametKUM/klustr?style=flat-square&cacheSeconds=300&v=2" alt="Latest release">
+  </a>
+  <a href="https://github.com/SametKUM/klustr/actions/workflows/release.yml">
+    <img src="https://github.com/SametKUM/klustr/actions/workflows/release.yml/badge.svg" alt="Release">
+  </a>
+</p>
+
+<p align="center">
+  <strong>macOS</strong>&nbsp;·&nbsp;<code>brew tap sametkum/klustr && brew install klustr</code><br>
+  <strong>Arch / CachyOS / Manjaro</strong>&nbsp;·&nbsp;<code>paru -S klustr-bin</code><br>
+  <strong>Debian / Ubuntu</strong>&nbsp;·&nbsp;<code>sudo apt install ./klustr_*_amd64.deb</code> &nbsp;(<a href="#debian--ubuntu-deb">download first</a>)
+</p>
+<p align="center">
+  <a href="#install">other install options</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/SametKUM/klustr/blob/main/docs/hero.mp4">
+    <img src="https://raw.githubusercontent.com/SametKUM/klustr/main/docs/hero.gif" width="900" alt="Klustr — live demo">
+  </a>
+</p>
+<p align="center">
+  <sub><a href="https://github.com/SametKUM/klustr/blob/main/docs/hero.mp4">▶ Watch the full-quality video</a></sub>
+</p>
+
+## What is Klustr?
+
+Klustr is a cross-platform Kubernetes desktop client built with [Wails](https://wails.io/) (Go + native webview) and React. It uses your existing `~/.kube/config` and speaks the standard Kubernetes API directly — **nothing is deployed in the cluster**. Drop the binary in, point at any context, and you're looking at a live view of everything you have permission to see — built-in resources, full **RBAC** with a **subject → effective-permissions** review, **Custom Resources (CRDs)**, **Helm releases**, **Argo CD Applications**, **Flux CD reconcilers**, **Tekton** pipelines, **Gateway API** routes, **cert-manager** certificates, and **Kyverno** policy reports included. No extra logins, no `argocd`, `flux`, `tkn` or `helm` CLI required — only your kubeconfig.
+
+## Features
+
+- 🔌 **Pure client.** No CRDs, no in-cluster components — works with whatever your kubeconfig already grants.
+- 🔁 **Live everywhere.** `client-go` informers, never polled.
+- 🌐 **Multi-context aggregation.** View 2+ clusters in one table, per-context status pings with latency in the status bar.
+- 👥 **Context groups & tags.** Named multi-context groups; color tags on the top bar so you always know which environment you're touching.
+- 📋 **Every built-in resource.** Workloads, networking, storage, config, admission, autoscaling, and the full **RBAC** set under a dedicated Access Control sidebar group.
+- 🔎 **Access Review.** Subject → effective-permissions **GVR × verb matrix** with the binding → role chain behind every ✓, wildcards and `cluster-admin` flagged. Live, no `--as` impersonation, no extra API traffic.
+- 🧩 **Custom Resources (CRDs).** Auto-discovered on connect, grouped by API group, watch-backed.
+- ⎈ **Helm.** First-class Helm v3: install / upgrade / rollback / uninstall with a **dry-run preview** before any change, plus repo management and chart search.
+- 🚢 **Argo CD.** Sync, Refresh, Rollback and cascade-aware Delete through the Kubernetes API — no `argocd-server`, no `argocd` CLI, no Argo login.
+- 🚀 **Flux CD.** Kustomization · HelmRelease · GitRepository · HelmRepository · OCIRepository · Bucket · Provider · Alert · Receiver, plus **ImageRepository**, **ImagePolicy** and **ImageUpdateAutomation**. Inspect scanned tags, selected images and digests, and automation Git commits; follow repository references across namespaces. Reconcile and Suspend/Resume actions are available where the resource API supports them, with no `flux` CLI required.
+- 🏗️ **Tekton.** PipelineRuns, TaskRuns, Pipelines and Tasks. A PipelineRun's **task table** joins the resolved pipeline with its TaskRuns and skipped tasks; TaskRun **step logs** open on the running or failed step; **Cancel** and **Rerun** without `tkn`.
+- 🌉 **Gateway API.** Typed informers; **listener table**, per-rule **match → backend → weight** matrix and `RouteParentStatus` so a misrouted parent or `RefNotPermitted` backend is one click away. Vendor-neutral.
+- 🔐 **cert-manager.** Certificates, Issuers / ClusterIssuers, and the full issuance chain — CertificateRequest → Order → Challenge — with ready/expiry status and a drill-down across the chain. One-click **Renew**, no `cmctl` CLI.
+- 🕸️ **Istio.** VirtualServices, DestinationRules and PeerAuthentications, watch-backed; the served API version is read from the discovered CRD rather than hardcoded.
+- **Cilium.** Dedicated views for network policies, endpoints, nodes, identities, CIDR groups, LoadBalancer IP pools, L2 announcement and egress gateway policies, and BGP configuration. Read policy rules, IP allocation and reported BGP peer status directly from CRDs, with links to referenced resources.
+- 🌳 **Karpenter.** NodePools, NodeClaims and AWS **EC2NodeClasses**, surfaced automatically when their CRDs are present. Follow a pool or claim to its node class and inspect resolved subnets, security groups, AMIs and their requirements, IAM configuration and readiness conditions.
+- 🛡️ **Kyverno.** ClusterPolicies, Policies, CEL ValidatingPolicies, PolicyExceptions and `wgpolicyk8s.io` **policy reports**. Each policy lists the resources it fails, and a resource's detail shows its own report.
+- 📜 **Logs.** Stern-style multi-pod streaming with per-pod ANSI colors, follow, save and regex.
+- 🖥️ **In-app exec.** SPDY shell into any container.
+- 🐚 **Node shell.** Root shell on any node via a temporary privileged `nsenter` pod that's removed when the session ends — no SSH, nothing pre-installed.
+- 🚧 **Cordon & drain.** One-click cordon/uncordon and a live-progress drain that evicts through the Eviction API (PDB-aware, skips DaemonSet & mirror pods).
+- 🔧 **YAML edit.** Monaco editor with a server-side dry-run diff before apply.
+- 🚀 **Scale, restart, pause/resume.** Replica controls, one-click rolling restart, inline pause/resume, HPA min/max editable inline.
+- 📐 **In-place pod resize.** Change a running container's CPU / memory requests and limits via the `pods/resize` subresource — no pod recreation; shows the live resize status (Deferred / Infeasible).
+- ⏪ **Rollout history & rollback.** Side-by-side template diff and one-click revert on Deployments / StatefulSets / DaemonSets.
+- 🔄 **Port-forwarding.** Suggested local ports, persistent header indicator, click-to-open in browser.
+- 🗺️ **Cluster overviews.** CPU / memory / pod donuts, workloads health, recent warnings — single-cluster or aggregated.
+- 🧭 **Cross-resource navigation.** Drill from workload to pod to node and back.
+- 🎨 **Themes & shortcuts.** Command palette (`⌘K`), pod search (`⌘P`), namespace search (`⌘N`), keyboard cheatsheet (`?`).
+
+## Screenshots
+
+Every shot is captured from two kind clusters seeded with realistic workloads and deliberate failures. The shots cycle through Klustr's themes, so the pack doubles as a tour of them — see [`docs/screenshots/`](docs/screenshots) for the full set.
+
+|   |   |
+|---|---|
+| ![Aggregated pods — Dracula](docs/screenshots/01-pods-aggregated-dracula.png) | ![Connections — Default Dark](docs/screenshots/02-connections-default-dark.png) |
+| **Aggregated pods** — two clusters and three namespaces in one table; failing pods sit next to the healthy rows | **Connections** — contexts grouped by tag, two checked for an aggregated session, a saved group for one-click reconnect |
+| ![Pod diagnosis — Default Light](docs/screenshots/03-pod-diagnosis-default-light.png) | ![Multi-pod logs — Dracula Light](docs/screenshots/04-logs-stream-dracula-light.png) |
+| **Pod diagnosis** — a card that says *why* the pod is unhealthy and what to check next | **Multi-pod logs** — one stream across a Deployment, a color per pod, live regex filter |
+| ![Debug container — One Dark](docs/screenshots/05-debug-container-one-dark.png) | ![Helm upgrade — Monokai Light](docs/screenshots/06-helm-upgrade-diff-monokai-light.png) |
+| **Debug container** — netshoot injected into a shell-less pod, `ps` / `curl` / `dig` against the target | **Helm upgrade** — values on the left, the dry-run rendered manifest on the right, apply only after reading it |
+| ![Argo CD — One Light](docs/screenshots/07-argo-applications-one-light.png) | ![Flux Kustomization — Monokai](docs/screenshots/08-flux-kustomization-monokai.png) |
+| **Argo CD** — Sync / Health pills, per-row Refresh, Suspend and Sync through the Kubernetes API | **Flux CD** — a failed Kustomization with its status message, source and path readable without YAML |
+| ![Gateway API — Tokyo Night](docs/screenshots/09-gateway-httproute-tokyo-night.png) | ![cert-manager chain — Nord Light](docs/screenshots/10-certmanager-chain-nord-light.png) |
+| **Gateway API** — rule matrix plus `RouteParentStatus`: Accepted, but `ResolvedRefs=False` with `RefNotPermitted` | **cert-manager** — Certificate → CertificateRequest → Order → Challenge, with the ACME self-check error |
+| ![Access Review — Nord](docs/screenshots/11-access-review-nord.png) | ![YAML diff — Default Dark](docs/screenshots/12-yaml-diff-default-dark.png) |
+| **Access Review** — a ServiceAccount's effective permissions as a resource × verb matrix per scope, wildcard rules flagged | **YAML edit** — Monaco editor with the server-side dry-run diff before apply |
+| ![Rollout history — Monokai Light](docs/screenshots/13-rollout-history-monokai-light.png) | ![Node drain — Dracula](docs/screenshots/14-node-drain-dracula.png) |
+| **Rollout history** — revision diff with change causes and one-click rollback | **Node drain** — Eviction API progress, the PDB-blocked pod called out and retried |
+| ![Terminal drawer — One Dark](docs/screenshots/15-terminal-drawer-one-dark.png) | ![Cluster overview — Nord](docs/screenshots/17-cluster-overview-nord.png) |
+| **Terminal** — a local shell pinned to a context under the table, `KUBECONFIG` already set | **Cluster overview** — CPU / memory / pod capacity per cluster and a live warnings feed |
+| ![Istio VirtualService — One Light](docs/screenshots/18-istio-virtualservice-one-light.png) | ![Karpenter NodeClaims — Tokyo Night](docs/screenshots/19-karpenter-nodeclaims-tokyo-night.png) |
+| **Istio** — a VirtualService's weighted canary and header match as a rule table | **Karpenter** — NodeClaims with node, pool, instance, zone and the Launched / Registered / Initialized steps |
+| ![KEDA HPA — Nord Light](docs/screenshots/20-keda-hpa-nord-light.png) | ![Tekton PipelineRun — Dracula Light](docs/screenshots/21-tekton-pipelinerun-dracula-light.png) |
+| **KEDA** — a KEDA-managed HPA with its external metrics mapped back to the cron and CPU triggers | **Tekton** — a failed PipelineRun's task table: the failing test, the tasks it skipped, and the finally task that still ran |
+| ![Kyverno Policy tab — Monokai](docs/screenshots/22-kyverno-policy-tab-monokai.png) | |
+| **Kyverno** — a Deployment's own policy report on its Policy tab, the failing count on the tab label | |
+
+## Install
+
+### macOS (Apple Silicon)
+
+The release build is signed with a Developer ID Application certificate and notarized by Apple, so Gatekeeper opens it directly — even offline.
+
+#### Homebrew
+
+```bash
+brew tap sametkum/klustr
+brew install klustr
+```
+
+After the initial `brew tap`, future updates are just `brew upgrade klustr` (or `brew upgrade` for everything), and `brew search klustr` / `brew info klustr` start finding it.
+
+#### Manual
+
+Download the latest darwin-arm64 tarball from the [Releases](https://github.com/SametKUM/klustr/releases/latest) page, then:
+
+```bash
+tar -xzf klustr-*-darwin-arm64.tar.gz
+mv klustr.app /Applications/
+open /Applications/klustr.app
+```
+
+### Linux (amd64)
+
+The Linux binary links against `webkit2gtk-4.1` + `gtk-3`. Ubuntu 24.04+, Fedora 39+, Arch and most other modern distros ship those runtime libraries by default; on Ubuntu 22.04 install `libwebkit2gtk-4.1-0 libgtk-3-0` first.
+
+#### Arch / CachyOS / Manjaro / Endeavour (AUR)
+
+```bash
+paru -S klustr-bin
+# or
+yay -S klustr-bin
+```
+
+The [`klustr-bin`](https://aur.archlinux.org/packages/klustr-bin) PKGBUILD uses the prebuilt release tarball, so install completes in seconds. `paru -Syu` keeps it up to date.
+
+#### Debian / Ubuntu (.deb)
+
+The .deb pulls in the runtime dependencies automatically and registers a `klustr` desktop entry.
+
+```bash
+VERSION="$(curl -fsSL https://api.github.com/repos/SametKUM/klustr/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+')"
+DEB="klustr_${VERSION#v}_amd64.deb"
+curl -LO "https://github.com/SametKUM/klustr/releases/download/${VERSION}/${DEB}"
+sudo apt install "./${DEB}"
+```
+
+#### Manual (tarball)
+
+Download the latest `linux-amd64` tarball from the [Releases](https://github.com/SametKUM/klustr/releases/latest) page, then:
+
+```bash
+tar -xzf klustr-*-linux-amd64.tar.gz
+install -Dm755 klustr ~/.local/bin/klustr
+klustr
+```
+
+### Windows
+
+Download the latest `windows-amd64` zip from the [Releases](https://github.com/SametKUM/klustr/releases/latest) page, extract it and run `klustr.exe`. Klustr is tested on Windows 11, which ships the WebView2 runtime it renders with.
+
+The Windows build is not code-signed yet. On first launch SmartScreen shows "Windows protected your PC": choose **More info**, then **Run anyway**. With Smart App Control on, Windows blocks unsigned apps outright.
+
+## Quick start
+
+1. Klustr reads `~/.kube/config` at launch.
+2. On first run, pick a context — or check **two or more** to view them aggregated as one cluster. Save a recurring selection as a named **group** for one-click reconnect, and toggle **Auto-connect** on a card to pin it as the default.
+3. Browse via the sidebar, click any row for a detail dialog, use `⌘K` to open the command palette, or `⌘P` to search pods by name. The header's **Disconnect** button drops you back to the picker at any time.
+
+## Documentation
+
+Task-focused guides live at [klustr.dev/docs](https://klustr.dev/docs/) (source: [SametKUM/klustr.dev](https://github.com/SametKUM/klustr.dev/tree/main/docs/guide)):
+
+- [Getting started](https://klustr.dev/docs/getting-started/) — contexts, namespaces, read-only mode
+- [Multi-context & aggregated mode](https://klustr.dev/docs/multi-context/) — many clusters as one, groups, tags
+- [Credential helpers](https://klustr.dev/docs/credential-helpers/) — aws-vault and other exec plugins under a GUI launch
+- [Cluster & workloads overviews](https://klustr.dev/docs/overview/) — capacity donuts, workload health, events feed
+- [Workloads & debugging](https://klustr.dev/docs/workloads-and-debugging/) — logs, exec, port-forward, node shell
+- [Terminal](https://klustr.dev/docs/terminal/) — the built-in shell drawer and external terminal apps
+- [Helm](https://klustr.dev/docs/helm/) · [GitOps: Argo CD & Flux](https://klustr.dev/docs/gitops/) · [Tekton Pipelines](https://klustr.dev/docs/tekton/) · [Gateway API](https://klustr.dev/docs/gateway-api/) · [Kyverno & policy reports](https://klustr.dev/docs/kyverno/) · [Platform integrations](https://klustr.dev/docs/integrations/) · [Custom Resources](https://klustr.dev/docs/custom-resources/)
+
+## Build from source
+
+```bash
+mise install     # installs Go, Node, Wails CLI pinned in .mise.toml
+wails dev        # hot-reload dev session
+
+# or a production build for your host platform
+wails build -trimpath -clean
+```
+
+## Architecture (short version)
+
+| Layer | Choice |
+|---|---|
+| Desktop | Wails v2 (Go + native webview) |
+| Backend | Go 1.26 + `client-go` (typed clientset + dynamic) + `sigs.k8s.io/gateway-api` |
+| Frontend | React 19 · TypeScript · Vite |
+| UI | Tailwind CSS · shadcn/ui |
+| State | Zustand (real-time) · TanStack Query (mutations only) |
+| Tables | TanStack Table |
+| Live data | `client-go` informers → Wails events → Zustand → React |
+
+Full design notes, conventions and the "add a new resource kind" recipe live in [`AGENTS.md`](AGENTS.md).
+
+## Roadmap
+
+- [x] Every built-in resource kind (incl. full RBAC: ServiceAccounts, Roles, RoleBindings, ClusterRoles, ClusterRoleBindings)
+- [x] **Access Review** — subject → effective-permission matrix with binding trace, implicit-group expansion (`system:serviceaccounts:*`, `system:authenticated`), wildcard / cluster-admin detection, live across every active context
+- [x] Logs, exec, port-forwarding
+- [x] Node shell (privileged `nsenter` pod), cordon/uncordon, PDB-aware drain
+- [x] YAML edit / apply with diff, scale, restart, deployment pause/resume, HPA inline edit
+- [x] In-place pod resize (CPU/memory requests & limits via the `pods/resize` subresource, no recreation)
+- [x] Rollout history with revision diff and one-click rollback (Deployments / StatefulSets / DaemonSets)
+- [x] Cross-resource navigation (related pods, owner/node links, back stack)
+- [x] Custom Resource Definitions (CRDs)
+- [x] Helm support — release browser, dry-run diff, install / upgrade / rollback / uninstall, repo management
+- [x] Gateway API — Gateways, HTTPRoutes, GRPCRoutes, GatewayClasses, ReferenceGrants (typed informers, status pills, listener / rule / RouteParentStatus tables)
+- [x] cert-manager — Certificates, Issuers / ClusterIssuers, CertificateRequests, Orders, Challenges (issuance-chain drill-down, ready/expiry status, one-click Renew)
+- [x] Istio — VirtualServices, DestinationRules, PeerAuthentications (served version read from the discovered CRD)
+- [x] Cilium — policies, endpoints, nodes, identities, CIDR groups, LB IPAM, L2 announcements, egress gateways and BGP (CRD-backed views)
+- [x] Karpenter — NodePools, NodeClaims, AWS EC2NodeClasses (provisioning status, resolved infrastructure and reference navigation)
+- [x] Flux image automation — ImageRepositories, ImagePolicies, ImageUpdateAutomations (tag/digest selection, Git update status, cross-namespace references)
+- [x] Tekton — PipelineRuns, TaskRuns, Pipelines, Tasks (task table, step logs, Cancel and Rerun)
+- [x] Kyverno — ClusterPolicies, Policies, ValidatingPolicies, PolicyExceptions, PolicyReports (per-policy violations, per-resource Policy tab)
+- [x] Multi-cluster aggregated mode + named context groups + per-context health ping
+- [x] Notarized macOS build — signed with a Developer ID Application certificate and notarized by Apple
+- [x] Linux (amd64) release distribution
+- [x] Windows (amd64) release distribution
+- [ ] Code-signed Windows build
+
+## Contributing
+
+Bug reports and focused pull requests are welcome.
+
+- Read [`AGENTS.md`](AGENTS.md) first — it's the architecture + conventions contract.
+- Use [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `refactor:` …) and prefer small, logically scoped commits.
+- Before opening a PR, run:
+  ```bash
+  go test klustr/internal/... && go vet ./...
+  cd frontend && npm test && npm run lint && npm run typecheck
+  ```
+- New user-facing features should include a screenshot or short clip in the PR description.
+
+Full guide: [`CONTRIBUTING.md`](CONTRIBUTING.md). Bug reports go through the [`bug_report.yml`](.github/ISSUE_TEMPLATE/bug_report.yml) issue template so the version / OS / cluster details we need actually land in the report. Found a security issue? Please report it privately — see the [security policy](SECURITY.md).
+
+## License
+
+Klustr is licensed under the [Apache License 2.0](LICENSE). The screenshots, demo video and other documentation under [`docs/`](docs) are licensed under [CC BY 4.0](docs/LICENSE).
+
+## Acknowledgments
+
+Built on the shoulders of: [Wails](https://wails.io/), [client-go](https://github.com/kubernetes/client-go), [React](https://react.dev/), [shadcn/ui](https://ui.shadcn.com/), [Tailwind CSS](https://tailwindcss.com/), [TanStack Table / Query](https://tanstack.com/), [xterm.js](https://xtermjs.org/), [Monaco Editor](https://microsoft.github.io/monaco-editor/), [Zustand](https://zustand-demo.pmnd.rs/), [Vite](https://vitejs.dev/), [mise](https://mise.jdx.dev/).

@@ -1,0 +1,767 @@
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { AlertTriangle, Info, MoreHorizontal } from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import { Copyable } from '@/features/_shared/Copyable'
+import { MetricsServerInstaller } from '@/features/_shared/MetricsServerInstaller'
+import { MetricsServerUninstaller } from '@/features/_shared/MetricsServerUninstaller'
+import { ProviderIcon } from '@/features/_shared/providerIcons'
+import { providerMeta } from '@/features/_shared/providerInfo'
+import { selectsTextWithin } from '@/features/_shared/textSelection'
+import {
+  api,
+  type ClusterOverview,
+  type ClusterPods,
+  type ClusterResource,
+  type ContextInfo,
+  type EventInfo,
+  type ServerVersion,
+} from '@/lib/api'
+import { onKubeChange } from '@/lib/events'
+import { formatAge } from '@/lib/time'
+import { useNowTick } from '@/lib/nowTick'
+import { useActiveContexts, useContextLabel, useIsAggregated, useUIStore } from '@/store/ui'
+import { ContextName } from '@/features/_shared/ContextName'
+import { RunningNowSection } from './RunningNowSection'
+
+const POLL_INTERVAL_MS = 15_000
+const WARNING_LIMIT = 50
+
+function isWatcherNotReady(err: unknown): boolean {
+  return String(err).includes('no active watcher')
+}
+
+type ClusterState = {
+  overview: ClusterOverview | null
+  overviewError: string | null
+  contextInfo: ContextInfo | null
+  serverVersion: ServerVersion | null
+  identityError: string | null
+  warnings: EventInfo[]
+  warningsError: string | null
+  lastUpdatedAt: number | null
+}
+
+const EMPTY_STATE: ClusterState = {
+  overview: null,
+  overviewError: null,
+  contextInfo: null,
+  serverVersion: null,
+  identityError: null,
+  warnings: [],
+  warningsError: null,
+  lastUpdatedAt: null,
+}
+
+type ContextWarning = {
+  contextName: string
+  event: EventInfo
+}
+
+export function OverviewView() {
+  const activeContexts = useActiveContexts()
+  const labelOf = useContextLabel()
+  const isAggregated = useIsAggregated()
+  const [byContext, setByContext] = useState<Record<string, ClusterState>>({})
+  const debounceRef = useRef<number | null>(null)
+  const ctxKey = activeContexts.join('|')
+  const aggregatedWarnings = useMemo(
+    () =>
+      activeContexts
+        .flatMap((contextName) =>
+          (byContext[contextName]?.warnings ?? []).map((event) => ({ contextName, event })),
+        )
+        .sort((a, b) => Date.parse(b.event.lastSeen) - Date.parse(a.event.lastSeen)),
+    [activeContexts, byContext],
+  )
+  const aggregatedWarningsError = activeContexts
+    .flatMap((contextName) => {
+      const error = byContext[contextName]?.warningsError
+      return error ? [`${labelOf(contextName)}: ${error}`] : []
+    })
+    .join('; ')
+
+  useEffect(() => {
+    if (activeContexts.length === 0) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- Overview data is scoped to active external contexts.
+      setByContext({})
+      return
+    }
+    let cancelled = false
+    const attempts = new Map<string, number>()
+    const retryTimers = new Map<string, number>()
+
+    const clearRetry = (ctx: string) => {
+      const id = retryTimers.get(ctx)
+      if (id !== undefined) {
+        window.clearTimeout(id)
+        retryTimers.delete(ctx)
+      }
+    }
+
+    const updateContext = (ctx: string, patch: Partial<ClusterState>) => {
+      setByContext((prev) => ({
+        ...prev,
+        [ctx]: { ...(prev[ctx] ?? EMPTY_STATE), ...patch },
+      }))
+    }
+
+    const loadIdentity = () => {
+      api
+        .listContexts()
+        .then((cfg) => {
+          if (cancelled) return
+          const contexts = new Map(cfg.contexts.map((context) => [context.name, context]))
+          for (const ctx of activeContexts) {
+            updateContext(ctx, { contextInfo: contexts.get(ctx) ?? null })
+          }
+        })
+        .catch(() => {})
+
+      for (const ctx of activeContexts) {
+        api
+          .pingContext(ctx)
+          .then((version) => {
+            if (!cancelled) {
+              updateContext(ctx, { serverVersion: version, identityError: null })
+            }
+          })
+          .catch((e) => {
+            if (!cancelled) {
+              updateContext(ctx, { identityError: String(e) })
+            }
+          })
+      }
+    }
+
+    const pullOne = (ctx: string) => {
+      clearRetry(ctx)
+      api
+        .getClusterOverview(ctx)
+        .then((v) => {
+          if (cancelled) return
+          updateContext(ctx, {
+            overview: v,
+            overviewError: null,
+            lastUpdatedAt: Date.now(),
+          })
+          attempts.set(ctx, 0)
+        })
+        .catch((e) => {
+          if (cancelled) return
+          const n = attempts.get(ctx) ?? 0
+          if (isWatcherNotReady(e) && n < 6) {
+            const next = n + 1
+            attempts.set(ctx, next)
+            const delay = Math.min(250 * 2 ** next, 4000)
+            retryTimers.set(ctx, window.setTimeout(() => pullOne(ctx), delay))
+            return
+          }
+          updateContext(ctx, { overviewError: String(e) })
+        })
+      api
+        .listClusterWarningEvents(ctx, WARNING_LIMIT)
+        .then((v) => {
+          if (cancelled) return
+          updateContext(ctx, { warnings: v ?? [], warningsError: null })
+        })
+        .catch((e) => {
+          if (cancelled) return
+          updateContext(ctx, { warningsError: String(e) })
+        })
+    }
+
+    const pullAll = () => {
+      for (const ctx of activeContexts) {
+        attempts.set(ctx, 0)
+        pullOne(ctx)
+      }
+    }
+
+    const scheduleSoon = () => {
+      if (debounceRef.current !== null) return
+      debounceRef.current = window.setTimeout(() => {
+        debounceRef.current = null
+        pullAll()
+      }, 300)
+    }
+
+    setByContext((prev) => {
+      const keep: Record<string, ClusterState> = {}
+      for (const ctx of activeContexts) {
+        keep[ctx] = prev[ctx] ?? EMPTY_STATE
+      }
+      return keep
+    })
+    loadIdentity()
+    pullAll()
+    const id = window.setInterval(pullAll, POLL_INTERVAL_MS)
+    const unsubs = ['Node', 'Pod', 'Namespace'].map((kind) =>
+      onKubeChange(kind, (ctx) => {
+        if (activeContexts.includes(ctx)) scheduleSoon()
+      }),
+    )
+
+    return () => {
+      cancelled = true
+      for (const id of retryTimers.values()) window.clearTimeout(id)
+      retryTimers.clear()
+      if (debounceRef.current !== null) {
+        window.clearTimeout(debounceRef.current)
+        debounceRef.current = null
+      }
+      window.clearInterval(id)
+      unsubs.forEach((u) => u())
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ctxKey])
+
+  if (activeContexts.length === 0) {
+    return (
+      <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+        Select a context to see the cluster overview.
+      </div>
+    )
+  }
+
+  return (
+    <div className="@container flex min-h-0 flex-1 flex-col overflow-y-auto">
+      {activeContexts.map((ctx, idx) => (
+        <ClusterSection
+          key={ctx}
+          contextName={ctx}
+          isAggregated={isAggregated}
+          state={byContext[ctx] ?? EMPTY_STATE}
+          isFirst={idx === 0}
+          showWarnings={!isAggregated}
+          runningNow={!isAggregated && <RunningNowSection activeContexts={activeContexts} />}
+        />
+      ))}
+      {isAggregated && (
+        <div className="border-t border-border pt-4">
+          <RunningNowSection activeContexts={activeContexts} />
+        </div>
+      )}
+      {isAggregated && (
+        <WarningsSection
+          warnings={aggregatedWarnings}
+          error={aggregatedWarningsError || null}
+          showContext
+        />
+      )}
+    </div>
+  )
+}
+
+function ClusterSection({
+  contextName,
+  isAggregated,
+  state,
+  isFirst,
+  showWarnings,
+  runningNow,
+}: {
+  contextName: string
+  isAggregated: boolean
+  state: ClusterState
+  isFirst: boolean
+  showWarnings: boolean
+  runningNow?: ReactNode
+}) {
+  const { overview, overviewError, warnings, warningsError, lastUpdatedAt } = state
+  const [installerOpen, setInstallerOpen] = useState(false)
+  const [uninstallerOpen, setUninstallerOpen] = useState(false)
+  const [klustrManaged, setKlustrManaged] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    api
+      .isMetricsServerKlustrManaged(contextName)
+      .then((managed) => {
+        if (!cancelled) setKlustrManaged(managed)
+      })
+      .catch(() => {
+        if (!cancelled) setKlustrManaged(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [contextName, lastUpdatedAt])
+  return (
+    <div className={isFirst ? '' : 'border-t border-border'}>
+      <div className="flex items-center justify-between gap-3 border-b border-border px-6 py-3">
+        <div className="flex items-center gap-2">
+          <h1 className="text-sm font-medium">
+            {isAggregated ? <ContextName name={contextName} /> : 'Cluster Overview'}
+          </h1>
+          <span className="text-xs text-muted-foreground">
+            {!isAggregated && (
+              <>
+                <ContextName name={contextName} />
+                {overview && ' · '}
+              </>
+            )}
+            {overview && (
+              <>
+                {overview.nodeCount} node{overview.nodeCount === 1 ? '' : 's'}
+                {' · '}
+                {overview.podCount} pod{overview.podCount === 1 ? '' : 's'}
+                {' · '}
+                {overview.namespaceCount} namespace{overview.namespaceCount === 1 ? '' : 's'}
+              </>
+            )}
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          <UpdatedAgo at={lastUpdatedAt} />
+          {klustrManaged && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  aria-label="Cluster tools"
+                  className="flex size-7 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+                >
+                  <MoreHorizontal className="size-4" aria-hidden />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-auto min-w-44">
+                <DropdownMenuItem
+                  className="whitespace-nowrap"
+                  onSelect={() => setUninstallerOpen(true)}
+                >
+                  Uninstall metrics-server
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+        </div>
+      </div>
+
+      {overview && !overview.metricsAvailable && (
+        <MetricsBanner
+          error={overview.metricsError ?? ''}
+          klustrManaged={klustrManaged}
+          onInstall={() => setInstallerOpen(true)}
+          onUninstall={() => setUninstallerOpen(true)}
+        />
+      )}
+      {overviewError && (
+        <div className="border-b border-destructive/30 bg-destructive/10 px-6 py-2 text-xs text-destructive">
+          {overviewError}
+        </div>
+      )}
+
+      {/* Column count follows the pane, not the viewport: with the sidebar
+          expanded, four cards at a 1280px window leave no room for the legend
+          values. Four columns need roughly 1152px of pane width. */}
+      <div className="@container">
+        <div className="grid gap-4 px-6 py-4 @2xl:grid-cols-2 @6xl:grid-cols-4">
+          <ResourceCard
+            title="CPU"
+            metric={overview?.cpu ?? null}
+            format={formatCores}
+            unit="cores"
+          />
+          <ResourceCard
+            title="Memory"
+            metric={overview?.memory ?? null}
+            format={formatBytes}
+            unit=""
+          />
+          <PodsCard pods={overview?.pods ?? null} />
+          <ClusterIdentityCard
+            contextName={contextName}
+            context={state.contextInfo}
+            version={state.serverVersion}
+            error={state.identityError}
+          />
+        </div>
+      </div>
+
+      {runningNow}
+      {showWarnings && (
+        <WarningsSection
+          warnings={warnings.map((event) => ({ contextName, event }))}
+          error={warningsError}
+          showContext={false}
+        />
+      )}
+      <MetricsServerInstaller
+        open={installerOpen}
+        onOpenChange={setInstallerOpen}
+        contextName={contextName}
+      />
+      <MetricsServerUninstaller
+        open={uninstallerOpen}
+        onOpenChange={setUninstallerOpen}
+        contextName={contextName}
+      />
+    </div>
+  )
+}
+
+function ClusterIdentityCard({
+  contextName,
+  context,
+  version,
+  error,
+}: {
+  contextName: string
+  context: ContextInfo | null
+  version: ServerVersion | null
+  error: string | null
+}) {
+  const meta = context ? providerMeta(context) : null
+
+  return (
+    <div className="rounded-lg border border-border bg-card p-4">
+      <div className="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+        Cluster
+      </div>
+      <div className="flex items-center gap-3">
+        <span className="grid size-12 shrink-0 place-items-center rounded-full bg-muted shadow-sm ring-1 ring-border/60">
+          {context ? (
+            <ProviderIcon context={context} className="size-6" />
+          ) : (
+            <span className="size-2 rounded-full bg-muted-foreground/40" aria-hidden />
+          )}
+        </span>
+        <div className="min-w-0">
+          <div className="truncate text-sm font-semibold" title={meta?.label ?? 'Kubernetes'}>
+            {meta?.label ?? 'Kubernetes'}
+          </div>
+          <ContextName name={contextName} className="block truncate text-xs text-muted-foreground" />
+        </div>
+      </div>
+      <div className="mt-4 flex flex-col gap-2 border-t border-border/60 pt-3 text-xs">
+        <IdentityRow
+          label="Kubernetes"
+          value={version?.gitVersion ?? '—'}
+          title={error ?? version?.gitVersion}
+        />
+        <IdentityRow
+          label="Control plane"
+          value={version?.platform ?? '—'}
+          title={error ?? version?.platform}
+        />
+      </div>
+    </div>
+  )
+}
+
+function IdentityRow({ label, value, title }: { label: string; value: string; title?: string }) {
+  return (
+    <div className="flex min-w-0 items-center justify-between gap-3">
+      <span className="shrink-0 text-muted-foreground">{label}</span>
+      <span className="truncate font-mono text-[0.6875rem] text-foreground" title={title}>
+        {value}
+      </span>
+    </div>
+  )
+}
+
+function UpdatedAgo({ at }: { at: number | null }) {
+  // Re-render on the shared 10s heartbeat instead of a per-instance interval,
+  // so aggregated mode doesn't run one ticking timer per visible context.
+  useNowTick()
+  if (at === null) {
+    return <span className="text-xs text-muted-foreground">Loading…</span>
+  }
+  return (
+    <span className="text-xs text-muted-foreground tabular-nums">
+      Updated {formatAge(new Date(at).toISOString())} ago
+    </span>
+  )
+}
+
+function MetricsBanner({
+  error,
+  klustrManaged,
+  onInstall,
+  onUninstall,
+}: {
+  error: string
+  klustrManaged: boolean
+  onInstall: () => void
+  onUninstall: () => void
+}) {
+  return (
+    <div className="flex items-start gap-2 border-b border-amber-500/30 bg-amber-500/10 px-6 py-2 text-xs text-amber-700 dark:text-amber-300">
+      <Info className="mt-0.5 size-3.5 shrink-0" />
+      <div className="flex-1">
+        <div className="font-medium">
+          {klustrManaged ? 'metrics-server not responding' : 'metrics-server not detected'}
+        </div>
+        <div className="opacity-80">
+          {klustrManaged
+            ? 'Klustr installed metrics-server in this cluster but the metrics.k8s.io API is not answering. The pod is most likely CrashLooping — uninstall to clean up, then reinstall.'
+            : 'Usage values require a working metrics.k8s.io API. Install metrics-server in the cluster to populate CPU and memory usage. Requests, limits, allocatable, and capacity values are still shown.'}
+          {error && <span className="ml-2 opacity-60">({error})</span>}
+        </div>
+      </div>
+      {klustrManaged ? (
+        <Button
+          size="xs"
+          variant="outline"
+          onClick={onUninstall}
+          className="shrink-0 border-amber-500/40 text-amber-700 hover:bg-amber-500/20 dark:text-amber-300"
+        >
+          Uninstall
+        </Button>
+      ) : (
+        <Button
+          size="xs"
+          variant="outline"
+          onClick={onInstall}
+          className="shrink-0 border-amber-500/40 text-amber-700 hover:bg-amber-500/20 dark:text-amber-300"
+        >
+          Install
+        </Button>
+      )}
+    </div>
+  )
+}
+
+type ResourceCardProps = {
+  title: string
+  metric: ClusterResource | null
+  format: (n: number) => string
+  unit: string
+}
+
+function ResourceCard({ title, metric, format, unit }: ResourceCardProps) {
+  const usage = metric?.usage ?? -1
+  const allocatable = metric?.allocatable ?? 0
+  const usagePct = usage >= 0 && allocatable > 0 ? Math.min(100, (usage / allocatable) * 100) : 0
+  const hasUsage = usage >= 0
+
+  return (
+    <div className="rounded-lg border border-border bg-card p-4">
+      <div className="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+        {title}
+        {unit && <span className="ml-1 normal-case opacity-60">({unit})</span>}
+      </div>
+      <div className="flex items-start gap-4">
+        <Donut percentage={usagePct} dimmed={!hasUsage} />
+        <div className="flex flex-1 flex-col gap-1.5 text-xs">
+          <Row
+            color="bg-emerald-500"
+            label="Usage"
+            value={hasUsage ? format(usage) : '—'}
+          />
+          <Row color="bg-sky-500" label="Requests" value={format(metric?.requests ?? 0)} />
+          <Row color="bg-indigo-500" label="Limits" value={format(metric?.limits ?? 0)} />
+          <Row color="bg-muted-foreground/50" label="Allocatable" value={format(allocatable)} />
+          <Row color="bg-muted-foreground/30" label="Capacity" value={format(metric?.capacity ?? 0)} />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function PodsCard({ pods }: { pods: ClusterPods | null }) {
+  const usage = pods?.usage ?? 0
+  const allocatable = pods?.allocatable ?? 0
+  const usagePct = allocatable > 0 ? Math.min(100, (usage / allocatable) * 100) : 0
+
+  return (
+    <div className="rounded-lg border border-border bg-card p-4">
+      <div className="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+        Pods
+      </div>
+      <div className="flex items-start gap-4">
+        <Donut percentage={usagePct} />
+        <div className="flex flex-1 flex-col gap-1.5 text-xs">
+          <Row color="bg-emerald-500" label="Usage" value={String(usage)} />
+          <Row
+            color="bg-muted-foreground/50"
+            label="Allocatable"
+            value={String(allocatable)}
+          />
+          <Row
+            color="bg-muted-foreground/30"
+            label="Capacity"
+            value={String(pods?.capacity ?? 0)}
+          />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// The value is the number the card exists for, so it never shrinks or wraps;
+// a tight card truncates the label instead.
+function Row({ color, label, value }: { color: string; label: string; value: string }) {
+  return (
+    <div className="flex items-center justify-between gap-2 tabular-nums">
+      <span className="inline-flex min-w-0 items-center gap-1.5 text-muted-foreground">
+        <span className={`size-2 shrink-0 rounded-full ${color}`} aria-hidden />
+        <span className="truncate" title={label}>
+          {label}
+        </span>
+      </span>
+      <span className="shrink-0 whitespace-nowrap font-mono text-[0.6875rem] text-foreground">{value}</span>
+    </div>
+  )
+}
+
+function Donut({ percentage, dimmed = false }: { percentage: number; dimmed?: boolean }) {
+  const size = 96
+  const stroke = 12
+  const radius = (size - stroke) / 2
+  const circumference = 2 * Math.PI * radius
+  const offset = circumference * (1 - percentage / 100)
+  const color = usageColor(percentage)
+  const labelColor = dimmed ? 'fill-muted-foreground' : 'fill-foreground'
+
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="shrink-0">
+      <circle
+        cx={size / 2}
+        cy={size / 2}
+        r={radius}
+        fill="none"
+        strokeWidth={stroke}
+        className="stroke-muted/60"
+      />
+      {!dimmed && (
+        <circle
+          cx={size / 2}
+          cy={size / 2}
+          r={radius}
+          fill="none"
+          strokeWidth={stroke}
+          strokeDasharray={circumference}
+          strokeDashoffset={offset}
+          strokeLinecap="round"
+          transform={`rotate(-90 ${size / 2} ${size / 2})`}
+          className={`transition-all ${color}`}
+        />
+      )}
+      <text
+        x="50%"
+        y="50%"
+        dominantBaseline="central"
+        textAnchor="middle"
+        className={`text-[0.875rem] font-semibold tabular-nums ${labelColor}`}
+      >
+        {dimmed ? '—' : `${Math.round(percentage)}%`}
+      </text>
+    </svg>
+  )
+}
+
+function usageColor(pct: number): string {
+  if (pct >= 85) return 'stroke-destructive'
+  if (pct >= 60) return 'stroke-amber-500'
+  return 'stroke-emerald-500'
+}
+
+function WarningsSection({
+  warnings,
+  error,
+  showContext,
+}: {
+  warnings: ContextWarning[]
+  error: string | null
+  showContext: boolean
+}) {
+  const setSelectedResource = useUIStore((s) => s.setSelectedResource)
+  return (
+    <div className="flex flex-col px-6 pb-6">
+      <div className="mb-2 flex items-center gap-2 text-xs">
+        <AlertTriangle className="size-3.5 text-destructive" />
+        <span className="font-medium">Warnings: {warnings.length}</span>
+        {error && <span className="text-muted-foreground">({error})</span>}
+      </div>
+      {warnings.length === 0 && !error ? (
+        <div className="rounded-lg border border-border bg-card px-3 py-4 text-center text-xs text-muted-foreground">
+          No recent warning events.
+        </div>
+      ) : (
+        <div className="overflow-hidden rounded-lg border border-border bg-card">
+          <table className="w-full text-xs tabular-nums">
+            <thead>
+              <tr className="border-b border-border text-left text-[0.6875rem] uppercase tracking-wide text-muted-foreground">
+                {showContext && <th className="px-3 py-2 font-medium">Context</th>}
+                <th className="px-3 py-2 font-medium">Message</th>
+                <th className="px-3 py-2 font-medium">Object</th>
+                <th className="px-3 py-2 font-medium">Reason</th>
+                <th className="px-3 py-2 font-medium">Count</th>
+                <th className="px-3 py-2 font-medium">Age</th>
+              </tr>
+            </thead>
+            <tbody className="allow-select">
+              {warnings.map(({ contextName, event: w }, i) => {
+                const clickable = Boolean(w.objectKind && w.objectName)
+                return (
+                  <tr
+                    key={`${contextName}/${w.namespace}/${w.name}/${i}`}
+                    className={`border-b border-border/50 last:border-0 hover:bg-muted/40 ${clickable ? 'cursor-pointer' : ''}`}
+                    onClick={
+                      clickable
+                        ? (ev) => {
+                            if (selectsTextWithin(ev.currentTarget)) return
+                            setSelectedResource({
+                              kind: w.objectKind,
+                              namespace: w.namespace,
+                              name: w.objectName,
+                              context: contextName,
+                            })
+                          }
+                        : undefined
+                    }
+                  >
+                    {showContext && (
+                      <td className="max-w-44 px-3 py-2 align-top">
+                        <ContextName
+                          name={contextName}
+                          className="block truncate font-mono text-[0.6875rem] text-muted-foreground"
+                        />
+                      </td>
+                    )}
+                    <td className="px-3 py-2 align-top text-foreground"><Copyable value={w.message} /></td>
+                    <td className="px-3 py-2 align-top font-mono text-[0.6875rem] text-muted-foreground">
+                      {w.objectKind}/{w.objectName}
+                      {w.namespace && (
+                        <span className="ml-1 opacity-60">· {w.namespace}</span>
+                      )}
+                    </td>
+                    <td className="px-3 py-2 align-top text-muted-foreground">{w.reason}</td>
+                    <td className="px-3 py-2 align-top text-muted-foreground">{w.count}</td>
+                    <td className="px-3 py-2 align-top text-muted-foreground">
+                      {formatAge(w.lastSeen)}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function formatCores(mc: number): string {
+  if (mc <= 0) return '0'
+  if (mc < 1000) return `${mc}m`
+  const cores = mc / 1000
+  return cores >= 10 ? cores.toFixed(0) : cores.toFixed(2)
+}
+
+function formatBytes(b: number): string {
+  if (b <= 0) return '0'
+  const kib = 1024
+  const mib = kib * 1024
+  const gib = mib * 1024
+  if (b >= gib) return `${(b / gib).toFixed(1)}GiB`
+  if (b >= mib) return `${(b / mib).toFixed(0)}MiB`
+  if (b >= kib) return `${(b / kib).toFixed(0)}KiB`
+  return `${b}B`
+}

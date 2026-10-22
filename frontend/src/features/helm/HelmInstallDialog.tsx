@@ -1,0 +1,474 @@
+import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
+import { useMutation } from '@tanstack/react-query'
+import { toast } from 'sonner'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
+import { api, type HelmDryRunResult, type HelmInstallOptions } from '@/lib/api'
+import { CopyButton } from '@/features/_shared/Copyable'
+import { useThemeMode } from '@/features/_shared/useThemeMode'
+import { useScaledFontSize } from '@/features/_shared/useFontScale'
+import { useContextLabel } from '@/store/ui'
+
+const Editor = lazy(() => import('@/lib/monaco').then((m) => ({ default: m.Editor })))
+
+type Mode = 'install' | 'upgrade'
+
+type OperationError = {
+  title: string
+  message: string
+}
+
+type Props = {
+  contextName: string | null
+  availableContexts?: string[]
+  onContextChange?: (contextName: string) => void
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  mode: Mode
+  // Required for upgrade, prefill for install.
+  initialName?: string
+  initialNamespace?: string
+  initialChartRef?: string
+  initialVersion?: string
+  initialValues?: string
+  onSuccess?: () => void
+}
+
+export function HelmInstallDialog({
+  contextName,
+  availableContexts,
+  onContextChange,
+  open,
+  onOpenChange,
+  mode,
+  initialName = '',
+  initialNamespace = 'default',
+  initialChartRef = '',
+  initialVersion = '',
+  initialValues = '',
+  onSuccess,
+}: Props) {
+  const theme = useThemeMode()
+  const editorFontSize = useScaledFontSize(12)
+  const labelOf = useContextLabel()
+  const [name, setName] = useState(initialName)
+  const [namespace, setNamespace] = useState(initialNamespace)
+  const [chartRef, setChartRef] = useState(initialChartRef)
+  const [chartVersion, setChartVersion] = useState(initialVersion)
+  const [values, setValues] = useState(initialValues)
+  const [createNS, setCreateNS] = useState(mode === 'install')
+  const [wait, setWait] = useState(false)
+  const [atomic, setAtomic] = useState(false)
+  const [resetValues, setResetValues] = useState(false)
+  const [dryRunResult, setDryRunResult] = useState<HelmDryRunResult | null>(null)
+  const [ambiguous, setAmbiguous] = useState<{ chart: string; repos: string[] } | null>(null)
+  const [operationError, setOperationError] = useState<OperationError | null>(null)
+
+  useEffect(() => {
+    if (!open) return
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- hydrate the form from the latest initial props when the dialog opens
+    setName(initialName)
+    setNamespace(initialNamespace || 'default')
+    setChartRef(initialChartRef)
+    setChartVersion(initialVersion)
+    setValues(initialValues)
+    setCreateNS(mode === 'install')
+    setWait(false)
+    setAtomic(false)
+    setResetValues(false)
+    setDryRunResult(null)
+    setAmbiguous(null)
+    setOperationError(null)
+  }, [open, mode, initialName, initialNamespace, initialChartRef, initialVersion, initialValues])
+
+  const opts: HelmInstallOptions = useMemo(
+    () => ({
+      contextName: contextName ?? '',
+      namespace,
+      releaseName: name,
+      chartRef,
+      chartVersion,
+      values,
+      createNamespace: createNS,
+      wait,
+      atomic,
+      timeoutSeconds: 0,
+      dryRun: false,
+      resetValues,
+    }),
+    [contextName, namespace, name, chartRef, chartVersion, values, createNS, wait, atomic, resetValues],
+  )
+
+  const dryRun = useMutation({
+    mutationFn: async () => {
+      if (!contextName) throw new Error('no context')
+      const fn = mode === 'install' ? api.installHelmRelease : api.upgradeHelmRelease
+      return fn({ ...opts, dryRun: true })
+    },
+    onSuccess: (r) => {
+      setDryRunResult(r)
+      toast.success('Dry-run rendered')
+    },
+    onError: (e) => {
+      const amb = parseAmbiguousRepos(e)
+      if (amb) {
+        setAmbiguous(amb)
+        setOperationError(null)
+        return
+      }
+      setOperationError({ title: 'Dry-run failed', message: String(e) })
+      toast.error(`Dry-run failed: ${String(e)}`)
+    },
+  })
+
+  const apply = useMutation({
+    mutationFn: async () => {
+      if (!contextName) throw new Error('no context')
+      const fn = mode === 'install' ? api.installHelmRelease : api.upgradeHelmRelease
+      await fn({ ...opts, dryRun: false })
+    },
+    onSuccess: () => {
+      toast.success(mode === 'install' ? `Installed ${name}` : `Upgraded ${name}`)
+      onOpenChange(false)
+      onSuccess?.()
+    },
+    onError: (e) => {
+      const amb = parseAmbiguousRepos(e)
+      if (amb) {
+        setAmbiguous(amb)
+        setOperationError(null)
+        return
+      }
+      const title = `${mode === 'install' ? 'Install' : 'Upgrade'} failed`
+      setOperationError({ title, message: String(e) })
+      toast.error(`${title}: ${String(e)}`)
+    },
+  })
+
+  const formInvalid = !contextName || !name.trim() || !chartRef.trim() || !namespace.trim()
+  const pending = dryRun.isPending || apply.isPending
+  const operationErrorSummary = operationError
+    ? summarizeServerError(operationError.message)
+    : ''
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(nextOpen) => {
+        if (pending) return
+        if (!nextOpen) setOperationError(null)
+        onOpenChange(nextOpen)
+      }}
+    >
+      <DialogContent className="flex h-[85vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-5xl">
+        <DialogHeader className="border-b border-border px-6 py-4">
+          <DialogTitle>
+            {mode === 'install' ? 'Install Helm chart' : `Upgrade ${initialName}`}
+          </DialogTitle>
+          <DialogDescription>
+            {mode === 'install'
+              ? 'Render a chart with custom values and install it as a new release.'
+              : 'Apply a new chart version or values to an existing release.'}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="flex min-h-0 flex-1">
+          <aside className="w-72 shrink-0 overflow-y-auto border-r border-border bg-sidebar/30 px-4 py-3 text-xs">
+            <Field label="Target context">
+              {mode === 'install' && onContextChange ? (
+                <select
+                  aria-label="Target context"
+                  value={contextName ?? ''}
+                  disabled={pending}
+                  onChange={(e) => {
+                    setDryRunResult(null)
+                    setOperationError(null)
+                    setAmbiguous(null)
+                    onContextChange(e.target.value)
+                  }}
+                  className="w-full rounded border border-border bg-background px-2 py-1.5 text-xs"
+                >
+                  <option value="" disabled>Select a context</option>
+                  {availableContexts?.map((ctx) => <option key={ctx} value={ctx}>{labelOf(ctx)}</option>)}
+                </select>
+              ) : <div className="break-all font-mono">{contextName ? labelOf(contextName) : 'No context selected'}</div>}
+              {!contextName && <p className="mt-1 text-muted-foreground">Select a target context to continue.</p>}
+            </Field>
+            <Field label="Release name">
+              <input
+                type="text"
+                spellCheck={false}
+                autoCorrect="off"
+                autoCapitalize="off"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                disabled={mode === 'upgrade'}
+                className="w-full rounded border border-border bg-background px-2 py-1 font-mono"
+              />
+            </Field>
+            <Field label="Namespace">
+              <input
+                type="text"
+                spellCheck={false}
+                autoCorrect="off"
+                autoCapitalize="off"
+                value={namespace}
+                onChange={(e) => setNamespace(e.target.value)}
+                disabled={mode === 'upgrade'}
+                className="w-full rounded border border-border bg-background px-2 py-1 font-mono"
+              />
+            </Field>
+            <Field label="Chart (repo/name or path)">
+              <input
+                type="text"
+                spellCheck={false}
+                autoCorrect="off"
+                autoCapitalize="off"
+                value={chartRef}
+                onChange={(e) => {
+                  setChartRef(e.target.value)
+                  setAmbiguous(null)
+                }}
+                placeholder="e.g. bitnami/redis or ./mychart"
+                className="w-full rounded border border-border bg-background px-2 py-1 font-mono"
+              />
+              {ambiguous && (
+                <div className="mt-1 rounded border border-amber-500/40 bg-amber-500/5 p-2 text-[0.6875rem] text-foreground">
+                  <p className="mb-1 text-muted-foreground">
+                    “{ambiguous.chart}” is in multiple repos. Pick one:
+                  </p>
+                  <div className="flex flex-wrap gap-1">
+                    {ambiguous.repos.map((r) => (
+                      <button
+                        key={r}
+                        type="button"
+                        onClick={() => {
+                          setChartRef(`${r}/${ambiguous.chart}`)
+                          setAmbiguous(null)
+                        }}
+                        className="rounded border border-border bg-background px-2 py-0.5 font-mono hover:bg-muted"
+                      >
+                        {r}/{ambiguous.chart}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </Field>
+            <Field label="Chart version (optional)">
+              <input
+                type="text"
+                spellCheck={false}
+                autoCorrect="off"
+                autoCapitalize="off"
+                value={chartVersion}
+                onChange={(e) => setChartVersion(e.target.value)}
+                placeholder="latest"
+                className="w-full rounded border border-border bg-background px-2 py-1 font-mono"
+              />
+            </Field>
+            {mode === 'install' && (
+              <label className="mt-2 flex items-center gap-2">
+                <Checkbox
+                  checked={createNS}
+                  onChange={(e) => setCreateNS(e.target.checked)}
+                />
+                Create namespace if missing
+              </label>
+            )}
+            <label className="mt-2 flex items-center gap-2">
+              <Checkbox
+                checked={wait}
+                onChange={(e) => setWait(e.target.checked)}
+              />
+              Wait until ready
+            </label>
+            <label className="mt-2 flex items-center gap-2">
+              <Checkbox
+                checked={atomic}
+                onChange={(e) => setAtomic(e.target.checked)}
+              />
+              Atomic (auto-rollback on failure)
+            </label>
+            {mode === 'upgrade' && (
+              <div className="mt-2 flex flex-col gap-1">
+                <label className="flex items-center gap-2">
+                  <Checkbox
+                    checked={resetValues}
+                    onChange={(e) => setResetValues(e.target.checked)}
+                  />
+                  Ignore previous release values
+                </label>
+                <p className="pl-5 text-[0.625rem] leading-snug text-muted-foreground/80">
+                  Helm normally re-uses the values you applied last time. With this on,
+                  it starts from chart defaults and only applies what's in the editor
+                  below — clear the editor too if you want full chart defaults.
+                </p>
+              </div>
+            )}
+          </aside>
+
+          <div className="flex min-w-0 flex-1 flex-col">
+            <div className="flex items-center gap-2 border-b border-border px-4 py-2 text-xs">
+              <span className="text-muted-foreground">Values (YAML)</span>
+              <span className="ml-auto">
+                {dryRunResult ? '● dry-run rendered' : 'No preview yet'}
+              </span>
+            </div>
+            <div className="min-h-0 flex-1">
+              <Suspense
+                fallback={
+                  <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
+                    Loading editor…
+                  </div>
+                }
+              >
+                <Editor
+                  height="100%"
+                  language="yaml"
+                  value={values}
+                  onChange={(v) => setValues(v ?? '')}
+                  theme={theme === 'dark' ? 'vs-dark' : 'vs-light'}
+                  options={{
+                    minimap: { enabled: false },
+                    lineNumbers: 'on',
+                    scrollBeyondLastLine: false,
+                    fontSize: editorFontSize,
+                    fontFamily:
+                      '"JetBrains Mono", "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+                    tabSize: 2,
+                    automaticLayout: true,
+                  }}
+                />
+              </Suspense>
+            </div>
+            {dryRunResult && (
+              <div className="max-h-[40%] min-h-0 shrink-0 overflow-y-auto border-t border-border bg-muted/40 p-3 text-xs">
+                <div className="mb-1 font-medium text-muted-foreground">Rendered manifest</div>
+                <pre className="overflow-x-auto whitespace-pre font-mono text-[0.6875rem]">
+                  {dryRunResult.manifest || '(empty)'}
+                </pre>
+                {dryRunResult.notes && (
+                  <>
+                    <div className="mb-1 mt-2 font-medium text-muted-foreground">Notes</div>
+                    <pre className="whitespace-pre-wrap font-mono text-[0.6875rem]">
+                      {dryRunResult.notes}
+                    </pre>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {operationError && (
+          <div
+            role="alert"
+            className="shrink-0 border-t border-destructive/40 bg-destructive/10 px-6 py-3 text-xs text-destructive"
+          >
+            <div className="flex items-start gap-2">
+              <div className="min-w-0 flex-1">
+                <p className="font-medium">{operationError.title}</p>
+                <p className="mt-0.5 break-words font-mono">{operationErrorSummary}</p>
+              </div>
+              <CopyButton
+                value={operationError.message}
+                toastLabel="Helm error"
+                ariaLabel="Copy Helm error"
+                className="shrink-0"
+                iconClassName="size-3.5"
+              />
+            </div>
+            {operationErrorSummary !== operationError.message && (
+              <details className="mt-2">
+                <summary className="cursor-pointer select-none text-[0.6875rem] text-destructive/80 hover:text-destructive">
+                  Full server response
+                </summary>
+                <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words font-mono text-[0.6875rem] text-destructive/90">
+                  {operationError.message}
+                </pre>
+              </details>
+            )}
+          </div>
+        )}
+
+        <div className="flex shrink-0 items-center justify-end gap-2 border-t border-border bg-muted/40 px-6 py-3">
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => {
+              setOperationError(null)
+              onOpenChange(false)
+            }}
+            disabled={pending}
+          >
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => {
+              setOperationError(null)
+              dryRun.mutate()
+            }}
+            disabled={pending || formInvalid}
+          >
+            {dryRun.isPending ? 'Rendering…' : 'Dry-run'}
+          </Button>
+          <Button
+            type="button"
+            onClick={() => {
+              setOperationError(null)
+              apply.mutate()
+            }}
+            disabled={pending || formInvalid}
+          >
+            {apply.isPending
+              ? mode === 'install'
+                ? 'Installing…'
+                : 'Upgrading…'
+              : mode === 'install'
+                ? 'Install'
+                : 'Upgrade'}
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function summarizeServerError(raw: string): string {
+  return raw
+    .replace(/\{.*\}/s, '{…}')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+const ambiguousRepoPattern = /chart "([^"]+)" is provided by multiple repos \(([^)]+)\)/
+
+function parseAmbiguousRepos(err: unknown): { chart: string; repos: string[] } | null {
+  const m = ambiguousRepoPattern.exec(String(err))
+  if (!m) return null
+  const repos = m[2]
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+  if (repos.length === 0) return null
+  return { chart: m[1], repos }
+}
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="mt-2 flex flex-col gap-1">
+      <label className="text-[0.625rem] uppercase tracking-wide text-muted-foreground">{label}</label>
+      {children}
+    </div>
+  )
+}

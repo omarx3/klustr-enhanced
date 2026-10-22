@@ -1,0 +1,1059 @@
+package kube
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+)
+
+// Flux CD CR resources. Versions differ across Flux releases (HelmRelease
+// was v2beta* before Flux 2.3, Provider and Alert are still v1beta3 while
+// Receiver is v1), so each is read at the version the cluster serves.
+var (
+	fluxKustomizationGR  = schema.GroupResource{Group: "kustomize.toolkit.fluxcd.io", Resource: "kustomizations"}
+	fluxHelmReleaseGR    = schema.GroupResource{Group: "helm.toolkit.fluxcd.io", Resource: "helmreleases"}
+	fluxGitRepositoryGR  = schema.GroupResource{Group: "source.toolkit.fluxcd.io", Resource: "gitrepositories"}
+	fluxHelmRepositoryGR = schema.GroupResource{Group: "source.toolkit.fluxcd.io", Resource: "helmrepositories"}
+	fluxOCIRepositoryGR  = schema.GroupResource{Group: "source.toolkit.fluxcd.io", Resource: "ocirepositories"}
+	fluxBucketGR         = schema.GroupResource{Group: "source.toolkit.fluxcd.io", Resource: "buckets"}
+	fluxProviderGR       = schema.GroupResource{Group: "notification.toolkit.fluxcd.io", Resource: "providers"}
+	fluxAlertGR          = schema.GroupResource{Group: "notification.toolkit.fluxcd.io", Resource: "alerts"}
+	fluxReceiverGR       = schema.GroupResource{Group: "notification.toolkit.fluxcd.io", Resource: "receivers"}
+)
+
+// fluxKindResource maps the Klustr-side Flux kind identifiers (used by the
+// frontend / Wails layer) to their resource. The "Flux" prefix keeps
+// the kind names from colliding with the helm v3 HelmRelease detail tab in
+// ResourceDetailPanel and disambiguates dispatch in the UI without a
+// special-case for every site.
+var fluxKindResource = map[string]schema.GroupResource{
+	"FluxImageRepository":       fluxImageRepositoryGR,
+	"FluxImagePolicy":           fluxImagePolicyGR,
+	"FluxImageUpdateAutomation": fluxImageUpdateAutomationGR,
+	"FluxKustomization":         fluxKustomizationGR,
+	"FluxHelmRelease":           fluxHelmReleaseGR,
+	"FluxGitRepository":         fluxGitRepositoryGR,
+	"FluxHelmRepository":        fluxHelmRepositoryGR,
+	"FluxOCIRepository":         fluxOCIRepositoryGR,
+	"FluxBucket":                fluxBucketGR,
+	"FluxProvider":              fluxProviderGR,
+	"FluxAlert":                 fluxAlertGR,
+	"FluxReceiver":              fluxReceiverGR,
+}
+
+// fluxReconcileAnnotation is the trigger Flux controllers watch for to
+// kick off a manual reconcile (same payload `flux reconcile` writes).
+// The value must be a RFC3339Nano timestamp that's strictly greater than
+// status.lastHandledReconcileAt or the controller treats it as already
+// handled and ignores the change.
+const fluxReconcileAnnotation = "reconcile.fluxcd.io/requestedAt"
+
+// ---------------------------------------------------------------------------
+// Kustomization
+// ---------------------------------------------------------------------------
+
+// FluxKustomizationInfo is the row shape rendered in the Kustomizations list.
+// Ready collapses .status.conditions[Ready] into a single label and Status
+// carries the matching message so the list cell can show both at a glance.
+type FluxKustomizationInfo struct {
+	Name                string `json:"name"`
+	Namespace           string `json:"namespace"`
+	Ready               string `json:"ready"`
+	Status              string `json:"status"`
+	Suspended           bool   `json:"suspended"`
+	Path                string `json:"path"`
+	SourceRef           string `json:"sourceRef"`
+	Revision            string `json:"revision"`
+	LastAppliedRevision string `json:"lastAppliedRevision"`
+	Interval            string `json:"interval"`
+	CreatedAt           string `json:"createdAt"`
+}
+
+// FluxKustomizationDetail extends the row shape with the spec fields the
+// detail panel renders alongside the conditions table.
+type FluxKustomizationDetail struct {
+	FluxKustomizationInfo
+	Conditions         []ConditionDetail `json:"conditions"`
+	Prune              bool              `json:"prune"`
+	Force              bool              `json:"force"`
+	Wait               bool              `json:"wait"`
+	TargetNamespace    string            `json:"targetNamespace"`
+	ServiceAccountName string            `json:"serviceAccountName"`
+	Timeout            string            `json:"timeout"`
+	RetryInterval      string            `json:"retryInterval"`
+	DependsOn          []string          `json:"dependsOn"`
+}
+
+func (m *ClientManager) ListFluxKustomizations(contextName, namespace string) []FluxKustomizationInfo {
+	return listServedRows(m, contextName, fluxKustomizationGR, namespace, extractFluxKustomization,
+		func(r FluxKustomizationInfo) (string, string) { return r.Namespace, r.Name })
+}
+
+func (m *ClientManager) GetFluxKustomization(ctx context.Context, contextName, namespace, name string) (*FluxKustomizationDetail, error) {
+	obj, err := m.getServedCR(ctx, contextName, fluxKustomizationGR, namespace, name)
+	if err != nil {
+		return nil, err
+	}
+	info := extractFluxKustomization(obj)
+	dependsOn, _, _ := nestedSliceNoCopy(obj.Object, "spec", "dependsOn")
+	targetNS, _, _ := unstructured.NestedString(obj.Object, "spec", "targetNamespace")
+	serviceAccount, _, _ := unstructured.NestedString(obj.Object, "spec", "serviceAccountName")
+	prune, _, _ := unstructured.NestedBool(obj.Object, "spec", "prune")
+	force, _, _ := unstructured.NestedBool(obj.Object, "spec", "force")
+	wait, _, _ := unstructured.NestedBool(obj.Object, "spec", "wait")
+	timeout, _, _ := unstructured.NestedString(obj.Object, "spec", "timeout")
+	retry, _, _ := unstructured.NestedString(obj.Object, "spec", "retryInterval")
+	return &FluxKustomizationDetail{
+		FluxKustomizationInfo: info,
+		Conditions:            crConditions(obj),
+		Prune:                 prune,
+		Force:                 force,
+		Wait:                  wait,
+		TargetNamespace:       targetNS,
+		ServiceAccountName:    serviceAccount,
+		Timeout:               timeout,
+		RetryInterval:         retry,
+		DependsOn:             extractDependsOnRefs(dependsOn),
+	}, nil
+}
+
+func extractFluxKustomization(obj *unstructured.Unstructured) FluxKustomizationInfo {
+	conds := crConditions(obj)
+	readyStatus, readyMsg := readyCondition(conds)
+	suspended, _, _ := unstructured.NestedBool(obj.Object, "spec", "suspend")
+	path, _, _ := unstructured.NestedString(obj.Object, "spec", "path")
+	interval, _, _ := unstructured.NestedString(obj.Object, "spec", "interval")
+	revision, _, _ := unstructured.NestedString(obj.Object, "status", "lastAttemptedRevision")
+	appliedRev, _, _ := unstructured.NestedString(obj.Object, "status", "lastAppliedRevision")
+	sourceRef, _, _ := nestedMapNoCopy(obj.Object, "spec", "sourceRef")
+	return FluxKustomizationInfo{
+		Name:                obj.GetName(),
+		Namespace:           obj.GetNamespace(),
+		Ready:               readyStatus,
+		Status:              readyMsg,
+		Suspended:           suspended,
+		Path:                path,
+		SourceRef:           formatSourceRef(sourceRef, obj.GetNamespace()),
+		Revision:            revision,
+		LastAppliedRevision: appliedRev,
+		Interval:            interval,
+		CreatedAt:           obj.GetCreationTimestamp().UTC().Format(time.RFC3339),
+	}
+}
+
+// ---------------------------------------------------------------------------
+// HelmRelease
+// ---------------------------------------------------------------------------
+
+// FluxHelmReleaseInfo is the row shape rendered in the Flux HelmReleases
+// list. Chart / Version come from .spec.chart.spec for the legacy embedded
+// chartTemplate, or .spec.chartRef for the new (Flux 2.3+) OCI/Helm ref.
+type FluxHelmReleaseInfo struct {
+	Name                string `json:"name"`
+	Namespace           string `json:"namespace"`
+	Ready               string `json:"ready"`
+	Status              string `json:"status"`
+	Suspended           bool   `json:"suspended"`
+	Chart               string `json:"chart"`
+	Version             string `json:"version"`
+	SourceRef           string `json:"sourceRef"`
+	LastAppliedRevision string `json:"lastAppliedRevision"`
+	Interval            string `json:"interval"`
+	CreatedAt           string `json:"createdAt"`
+}
+
+type FluxHelmReleaseDetail struct {
+	FluxHelmReleaseInfo
+	Conditions       []ConditionDetail `json:"conditions"`
+	ReleaseName      string            `json:"releaseName"`
+	TargetNamespace  string            `json:"targetNamespace"`
+	StorageNamespace string            `json:"storageNamespace"`
+	ServiceAccount   string            `json:"serviceAccount"`
+	Timeout          string            `json:"timeout"`
+	DependsOn        []string          `json:"dependsOn"`
+}
+
+func (m *ClientManager) ListFluxHelmReleases(contextName, namespace string) []FluxHelmReleaseInfo {
+	return listServedRows(m, contextName, fluxHelmReleaseGR, namespace, extractFluxHelmRelease,
+		func(r FluxHelmReleaseInfo) (string, string) { return r.Namespace, r.Name })
+}
+
+func (m *ClientManager) GetFluxHelmRelease(ctx context.Context, contextName, namespace, name string) (*FluxHelmReleaseDetail, error) {
+	obj, err := m.getServedCR(ctx, contextName, fluxHelmReleaseGR, namespace, name)
+	if err != nil {
+		return nil, err
+	}
+	info := extractFluxHelmRelease(obj)
+	releaseName, _, _ := unstructured.NestedString(obj.Object, "spec", "releaseName")
+	targetNS, _, _ := unstructured.NestedString(obj.Object, "spec", "targetNamespace")
+	storageNS, _, _ := unstructured.NestedString(obj.Object, "spec", "storageNamespace")
+	serviceAccount, _, _ := unstructured.NestedString(obj.Object, "spec", "serviceAccountName")
+	timeout, _, _ := unstructured.NestedString(obj.Object, "spec", "timeout")
+	dependsOn, _, _ := nestedSliceNoCopy(obj.Object, "spec", "dependsOn")
+	return &FluxHelmReleaseDetail{
+		FluxHelmReleaseInfo: info,
+		Conditions:          crConditions(obj),
+		ReleaseName:         releaseName,
+		TargetNamespace:     targetNS,
+		StorageNamespace:    storageNS,
+		ServiceAccount:      serviceAccount,
+		Timeout:             timeout,
+		DependsOn:           extractDependsOnRefs(dependsOn),
+	}, nil
+}
+
+func extractFluxHelmRelease(obj *unstructured.Unstructured) FluxHelmReleaseInfo {
+	conds := crConditions(obj)
+	readyStatus, readyMsg := readyCondition(conds)
+	suspended, _, _ := unstructured.NestedBool(obj.Object, "spec", "suspend")
+	interval, _, _ := unstructured.NestedString(obj.Object, "spec", "interval")
+	appliedRev, _, _ := unstructured.NestedString(obj.Object, "status", "lastAppliedRevision")
+	if appliedRev == "" {
+		// Older Flux installs surface this under history[0].
+		if hist, found, _ := nestedSliceNoCopy(obj.Object, "status", "history"); found && len(hist) > 0 {
+			if h0, ok := hist[0].(map[string]any); ok {
+				if r, _ := h0["chartVersion"].(string); r != "" {
+					appliedRev = r
+				}
+			}
+		}
+	}
+
+	// Chart name + version live in two shapes depending on Flux version:
+	//   .spec.chart.spec.chart / .version  (legacy in-place chartTemplate)
+	//   .spec.chartRef.name + .spec.chartRef.kind (OCIRepository / HelmChart)
+	chart, version, sourceRef := extractHelmReleaseChart(obj)
+
+	return FluxHelmReleaseInfo{
+		Name:                obj.GetName(),
+		Namespace:           obj.GetNamespace(),
+		Ready:               readyStatus,
+		Status:              readyMsg,
+		Suspended:           suspended,
+		Chart:               chart,
+		Version:             version,
+		SourceRef:           sourceRef,
+		LastAppliedRevision: appliedRev,
+		Interval:            interval,
+		CreatedAt:           obj.GetCreationTimestamp().UTC().Format(time.RFC3339),
+	}
+}
+
+// extractHelmReleaseChart unpacks the chart name, version, and human source
+// reference from a HelmRelease, supporting both the embedded chartTemplate
+// and the chartRef (Flux 2.3+) shapes. Empty strings when neither block is
+// populated — the caller renders "—" placeholders in that case.
+func extractHelmReleaseChart(obj *unstructured.Unstructured) (chart, version, sourceRef string) {
+	if chartTemplate, found, _ := nestedMapNoCopy(obj.Object, "spec", "chart", "spec"); found && chartTemplate != nil {
+		chart, _ = chartTemplate["chart"].(string)
+		version, _ = chartTemplate["version"].(string)
+		if sr, ok := chartTemplate["sourceRef"].(map[string]any); ok {
+			sourceRef = formatSourceRef(sr, obj.GetNamespace())
+		}
+		return
+	}
+	if chartRef, found, _ := nestedMapNoCopy(obj.Object, "spec", "chartRef"); found && chartRef != nil {
+		chart, _ = chartRef["name"].(string)
+		sourceRef = formatSourceRef(chartRef, obj.GetNamespace())
+	}
+	return
+}
+
+// ---------------------------------------------------------------------------
+// GitRepository
+// ---------------------------------------------------------------------------
+
+type FluxGitRepositoryInfo struct {
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+	Ready     string `json:"ready"`
+	Status    string `json:"status"`
+	Suspended bool   `json:"suspended"`
+	URL       string `json:"url"`
+	Ref       string `json:"ref"`
+	Revision  string `json:"revision"`
+	Interval  string `json:"interval"`
+	CreatedAt string `json:"createdAt"`
+}
+
+type FluxGitRepositoryDetail struct {
+	FluxGitRepositoryInfo
+	Conditions     []ConditionDetail `json:"conditions"`
+	SecretRef      string            `json:"secretRef"`
+	Timeout        string            `json:"timeout"`
+	IgnorePatterns string            `json:"ignorePatterns"`
+	Verification   string            `json:"verification"`
+}
+
+func (m *ClientManager) ListFluxGitRepositories(contextName, namespace string) []FluxGitRepositoryInfo {
+	return listServedRows(m, contextName, fluxGitRepositoryGR, namespace, extractFluxGitRepository,
+		func(r FluxGitRepositoryInfo) (string, string) { return r.Namespace, r.Name })
+}
+
+func (m *ClientManager) GetFluxGitRepository(ctx context.Context, contextName, namespace, name string) (*FluxGitRepositoryDetail, error) {
+	obj, err := m.getServedCR(ctx, contextName, fluxGitRepositoryGR, namespace, name)
+	if err != nil {
+		return nil, err
+	}
+	info := extractFluxGitRepository(obj)
+	timeout, _, _ := unstructured.NestedString(obj.Object, "spec", "timeout")
+	ignore, _, _ := unstructured.NestedString(obj.Object, "spec", "ignore")
+	verifyMode, _, _ := unstructured.NestedString(obj.Object, "spec", "verify", "mode")
+	secretRef := nestedRefName(obj, "spec", "secretRef")
+	return &FluxGitRepositoryDetail{
+		FluxGitRepositoryInfo: info,
+		Conditions:            crConditions(obj),
+		SecretRef:             secretRef,
+		Timeout:               timeout,
+		IgnorePatterns:        ignore,
+		Verification:          verifyMode,
+	}, nil
+}
+
+func extractFluxGitRepository(obj *unstructured.Unstructured) FluxGitRepositoryInfo {
+	conds := crConditions(obj)
+	readyStatus, readyMsg := readyCondition(conds)
+	suspended, _, _ := unstructured.NestedBool(obj.Object, "spec", "suspend")
+	url, _, _ := unstructured.NestedString(obj.Object, "spec", "url")
+	interval, _, _ := unstructured.NestedString(obj.Object, "spec", "interval")
+	revision, _, _ := unstructured.NestedString(obj.Object, "status", "artifact", "revision")
+	return FluxGitRepositoryInfo{
+		Name:      obj.GetName(),
+		Namespace: obj.GetNamespace(),
+		Ready:     readyStatus,
+		Status:    readyMsg,
+		Suspended: suspended,
+		URL:       url,
+		Ref:       extractGitRef(obj),
+		Revision:  revision,
+		Interval:  interval,
+		CreatedAt: obj.GetCreationTimestamp().UTC().Format(time.RFC3339),
+	}
+}
+
+// extractGitRef collapses .spec.ref into a single human-readable label.
+// Flux accepts branch/tag/semver/commit as alternative one-of fields; the
+// CRD doesn't forbid setting more than one, so pick the most specific.
+func extractGitRef(obj *unstructured.Unstructured) string {
+	ref, _, _ := nestedMapNoCopy(obj.Object, "spec", "ref")
+	if ref == nil {
+		return ""
+	}
+	if v, _ := ref["commit"].(string); v != "" {
+		return "commit: " + v
+	}
+	if v, _ := ref["semver"].(string); v != "" {
+		return "semver: " + v
+	}
+	if v, _ := ref["tag"].(string); v != "" {
+		return "tag: " + v
+	}
+	if v, _ := ref["branch"].(string); v != "" {
+		return "branch: " + v
+	}
+	if v, _ := ref["name"].(string); v != "" {
+		return "name: " + v
+	}
+	return ""
+}
+
+// ---------------------------------------------------------------------------
+// HelmRepository
+// ---------------------------------------------------------------------------
+
+// FluxHelmRepositoryInfo is the row shape for the HelmRepositories view.
+// Type collapses .spec.type (default | oci) into a single column the user
+// can scan; for OCI repos the same .spec.url is still rendered as-is so
+// the registry host is visible.
+type FluxHelmRepositoryInfo struct {
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+	Ready     string `json:"ready"`
+	Status    string `json:"status"`
+	Suspended bool   `json:"suspended"`
+	Type      string `json:"type"`
+	Provider  string `json:"provider"`
+	URL       string `json:"url"`
+	Revision  string `json:"revision"`
+	Interval  string `json:"interval"`
+	CreatedAt string `json:"createdAt"`
+}
+
+type FluxHelmRepositoryDetail struct {
+	FluxHelmRepositoryInfo
+	Conditions []ConditionDetail `json:"conditions"`
+	SecretRef  string            `json:"secretRef"`
+	Timeout    string            `json:"timeout"`
+	PassCreds  bool              `json:"passCredentials"`
+}
+
+func (m *ClientManager) ListFluxHelmRepositories(contextName, namespace string) []FluxHelmRepositoryInfo {
+	return listServedRows(m, contextName, fluxHelmRepositoryGR, namespace, extractFluxHelmRepository,
+		func(r FluxHelmRepositoryInfo) (string, string) { return r.Namespace, r.Name })
+}
+
+func (m *ClientManager) GetFluxHelmRepository(ctx context.Context, contextName, namespace, name string) (*FluxHelmRepositoryDetail, error) {
+	obj, err := m.getServedCR(ctx, contextName, fluxHelmRepositoryGR, namespace, name)
+	if err != nil {
+		return nil, err
+	}
+	info := extractFluxHelmRepository(obj)
+	timeout, _, _ := unstructured.NestedString(obj.Object, "spec", "timeout")
+	passCreds, _, _ := unstructured.NestedBool(obj.Object, "spec", "passCredentials")
+	secretRef := nestedRefName(obj, "spec", "secretRef")
+	return &FluxHelmRepositoryDetail{
+		FluxHelmRepositoryInfo: info,
+		Conditions:             crConditions(obj),
+		SecretRef:              secretRef,
+		Timeout:                timeout,
+		PassCreds:              passCreds,
+	}, nil
+}
+
+func extractFluxHelmRepository(obj *unstructured.Unstructured) FluxHelmRepositoryInfo {
+	conds := crConditions(obj)
+	readyStatus, readyMsg := readyCondition(conds)
+	suspended, _, _ := unstructured.NestedBool(obj.Object, "spec", "suspend")
+	url, _, _ := unstructured.NestedString(obj.Object, "spec", "url")
+	repoType, _, _ := unstructured.NestedString(obj.Object, "spec", "type")
+	provider, _, _ := unstructured.NestedString(obj.Object, "spec", "provider")
+	interval, _, _ := unstructured.NestedString(obj.Object, "spec", "interval")
+	// OCI HelmRepositories never produce an artifact (the chart pull happens
+	// on HelmRelease side), so this field is only meaningful for the
+	// default-type Helm index path.
+	revision, _, _ := unstructured.NestedString(obj.Object, "status", "artifact", "revision")
+	if repoType == "" {
+		repoType = "default"
+	}
+	return FluxHelmRepositoryInfo{
+		Name:      obj.GetName(),
+		Namespace: obj.GetNamespace(),
+		Ready:     readyStatus,
+		Status:    readyMsg,
+		Suspended: suspended,
+		Type:      repoType,
+		Provider:  provider,
+		URL:       url,
+		Revision:  revision,
+		Interval:  interval,
+		CreatedAt: obj.GetCreationTimestamp().UTC().Format(time.RFC3339),
+	}
+}
+
+// ---------------------------------------------------------------------------
+// OCIRepository
+// ---------------------------------------------------------------------------
+
+// FluxOCIRepositoryInfo is the row shape for the OCIRepositories view.
+// Unlike HelmRepository, an OCIRepository always produces an artifact —
+// surface the resolved digest/tag/semver in Revision so the user can tell
+// whether source-controller already pulled the new push.
+type FluxOCIRepositoryInfo struct {
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+	Ready     string `json:"ready"`
+	Status    string `json:"status"`
+	Suspended bool   `json:"suspended"`
+	URL       string `json:"url"`
+	Ref       string `json:"ref"`
+	Provider  string `json:"provider"`
+	Revision  string `json:"revision"`
+	Interval  string `json:"interval"`
+	CreatedAt string `json:"createdAt"`
+}
+
+type FluxOCIRepositoryDetail struct {
+	FluxOCIRepositoryInfo
+	Conditions  []ConditionDetail `json:"conditions"`
+	SecretRef   string            `json:"secretRef"`
+	ServiceAcct string            `json:"serviceAccountName"`
+	CertSecret  string            `json:"certSecretRef"`
+	Timeout     string            `json:"timeout"`
+	Verify      string            `json:"verify"`
+	Insecure    bool              `json:"insecure"`
+}
+
+func (m *ClientManager) ListFluxOCIRepositories(contextName, namespace string) []FluxOCIRepositoryInfo {
+	return listServedRows(m, contextName, fluxOCIRepositoryGR, namespace, extractFluxOCIRepository,
+		func(r FluxOCIRepositoryInfo) (string, string) { return r.Namespace, r.Name })
+}
+
+func (m *ClientManager) GetFluxOCIRepository(ctx context.Context, contextName, namespace, name string) (*FluxOCIRepositoryDetail, error) {
+	obj, err := m.getServedCR(ctx, contextName, fluxOCIRepositoryGR, namespace, name)
+	if err != nil {
+		return nil, err
+	}
+	info := extractFluxOCIRepository(obj)
+	timeout, _, _ := unstructured.NestedString(obj.Object, "spec", "timeout")
+	insecure, _, _ := unstructured.NestedBool(obj.Object, "spec", "insecure")
+	sa, _, _ := unstructured.NestedString(obj.Object, "spec", "serviceAccountName")
+	secretRef := nestedRefName(obj, "spec", "secretRef")
+	certSecret := nestedRefName(obj, "spec", "certSecretRef")
+	verifyMode, _, _ := unstructured.NestedString(obj.Object, "spec", "verify", "provider")
+	return &FluxOCIRepositoryDetail{
+		FluxOCIRepositoryInfo: info,
+		Conditions:            crConditions(obj),
+		SecretRef:             secretRef,
+		ServiceAcct:           sa,
+		CertSecret:            certSecret,
+		Timeout:               timeout,
+		Verify:                verifyMode,
+		Insecure:              insecure,
+	}, nil
+}
+
+func extractFluxOCIRepository(obj *unstructured.Unstructured) FluxOCIRepositoryInfo {
+	conds := crConditions(obj)
+	readyStatus, readyMsg := readyCondition(conds)
+	suspended, _, _ := unstructured.NestedBool(obj.Object, "spec", "suspend")
+	url, _, _ := unstructured.NestedString(obj.Object, "spec", "url")
+	provider, _, _ := unstructured.NestedString(obj.Object, "spec", "provider")
+	interval, _, _ := unstructured.NestedString(obj.Object, "spec", "interval")
+	revision, _, _ := unstructured.NestedString(obj.Object, "status", "artifact", "revision")
+	return FluxOCIRepositoryInfo{
+		Name:      obj.GetName(),
+		Namespace: obj.GetNamespace(),
+		Ready:     readyStatus,
+		Status:    readyMsg,
+		Suspended: suspended,
+		URL:       url,
+		Ref:       extractOCIRef(obj),
+		Provider:  provider,
+		Revision:  revision,
+		Interval:  interval,
+		CreatedAt: obj.GetCreationTimestamp().UTC().Format(time.RFC3339),
+	}
+}
+
+// extractOCIRef collapses .spec.ref into a single human label. Like
+// GitRepository's ref block, OCI accepts digest/semver/tag as alternative
+// one-of fields — pick the most specific the CR actually carries.
+func extractOCIRef(obj *unstructured.Unstructured) string {
+	ref, _, _ := nestedMapNoCopy(obj.Object, "spec", "ref")
+	if ref == nil {
+		return ""
+	}
+	if v, _ := ref["digest"].(string); v != "" {
+		return "digest: " + v
+	}
+	if v, _ := ref["semver"].(string); v != "" {
+		return "semver: " + v
+	}
+	if v, _ := ref["tag"].(string); v != "" {
+		return "tag: " + v
+	}
+	return ""
+}
+
+// ---------------------------------------------------------------------------
+// Bucket
+// ---------------------------------------------------------------------------
+
+// FluxBucketInfo is the row shape for the Buckets view. Buckets connect
+// Flux to S3-API-compatible object storage (AWS S3, GCS via interop,
+// MinIO, …) — Provider tells the operator which auth path was configured.
+type FluxBucketInfo struct {
+	Name       string `json:"name"`
+	Namespace  string `json:"namespace"`
+	Ready      string `json:"ready"`
+	Status     string `json:"status"`
+	Suspended  bool   `json:"suspended"`
+	Provider   string `json:"provider"`
+	BucketName string `json:"bucketName"`
+	Endpoint   string `json:"endpoint"`
+	Region     string `json:"region"`
+	Revision   string `json:"revision"`
+	Interval   string `json:"interval"`
+	CreatedAt  string `json:"createdAt"`
+}
+
+type FluxBucketDetail struct {
+	FluxBucketInfo
+	Conditions []ConditionDetail `json:"conditions"`
+	SecretRef  string            `json:"secretRef"`
+	Timeout    string            `json:"timeout"`
+	Insecure   bool              `json:"insecure"`
+	Prefix     string            `json:"prefix"`
+}
+
+func (m *ClientManager) ListFluxBuckets(contextName, namespace string) []FluxBucketInfo {
+	return listServedRows(m, contextName, fluxBucketGR, namespace, extractFluxBucket,
+		func(r FluxBucketInfo) (string, string) { return r.Namespace, r.Name })
+}
+
+func (m *ClientManager) GetFluxBucket(ctx context.Context, contextName, namespace, name string) (*FluxBucketDetail, error) {
+	obj, err := m.getServedCR(ctx, contextName, fluxBucketGR, namespace, name)
+	if err != nil {
+		return nil, err
+	}
+	info := extractFluxBucket(obj)
+	timeout, _, _ := unstructured.NestedString(obj.Object, "spec", "timeout")
+	insecure, _, _ := unstructured.NestedBool(obj.Object, "spec", "insecure")
+	prefix, _, _ := unstructured.NestedString(obj.Object, "spec", "prefix")
+	secretRef := nestedRefName(obj, "spec", "secretRef")
+	return &FluxBucketDetail{
+		FluxBucketInfo: info,
+		Conditions:     crConditions(obj),
+		SecretRef:      secretRef,
+		Timeout:        timeout,
+		Insecure:       insecure,
+		Prefix:         prefix,
+	}, nil
+}
+
+func extractFluxBucket(obj *unstructured.Unstructured) FluxBucketInfo {
+	conds := crConditions(obj)
+	readyStatus, readyMsg := readyCondition(conds)
+	suspended, _, _ := unstructured.NestedBool(obj.Object, "spec", "suspend")
+	provider, _, _ := unstructured.NestedString(obj.Object, "spec", "provider")
+	bucket, _, _ := unstructured.NestedString(obj.Object, "spec", "bucketName")
+	endpoint, _, _ := unstructured.NestedString(obj.Object, "spec", "endpoint")
+	region, _, _ := unstructured.NestedString(obj.Object, "spec", "region")
+	interval, _, _ := unstructured.NestedString(obj.Object, "spec", "interval")
+	revision, _, _ := unstructured.NestedString(obj.Object, "status", "artifact", "revision")
+	if provider == "" {
+		provider = "generic"
+	}
+	return FluxBucketInfo{
+		Name:       obj.GetName(),
+		Namespace:  obj.GetNamespace(),
+		Ready:      readyStatus,
+		Status:     readyMsg,
+		Suspended:  suspended,
+		Provider:   provider,
+		BucketName: bucket,
+		Endpoint:   endpoint,
+		Region:     region,
+		Revision:   revision,
+		Interval:   interval,
+		CreatedAt:  obj.GetCreationTimestamp().UTC().Format(time.RFC3339),
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Provider (notification.toolkit)
+// ---------------------------------------------------------------------------
+
+// FluxProviderInfo is the row shape for the Providers view. Address is
+// elided when it comes from a Secret — leaks of webhook URLs (Slack
+// incoming hook = bearer auth) are a bad surprise to discover from a
+// screenshot.
+type FluxProviderInfo struct {
+	Name              string `json:"name"`
+	Namespace         string `json:"namespace"`
+	Ready             string `json:"ready"`
+	Status            string `json:"status"`
+	Suspended         bool   `json:"suspended"`
+	Type              string `json:"type"`
+	Channel           string `json:"channel"`
+	Username          string `json:"username"`
+	Address           string `json:"address"`
+	AddressFromSecret bool   `json:"addressFromSecret"`
+	CreatedAt         string `json:"createdAt"`
+}
+
+type FluxProviderDetail struct {
+	FluxProviderInfo
+	Conditions []ConditionDetail `json:"conditions"`
+	SecretRef  string            `json:"secretRef"`
+	CertSecret string            `json:"certSecretRef"`
+	Proxy      string            `json:"proxy"`
+	Timeout    string            `json:"timeout"`
+}
+
+func (m *ClientManager) ListFluxProviders(contextName, namespace string) []FluxProviderInfo {
+	return listServedRows(m, contextName, fluxProviderGR, namespace, extractFluxProvider,
+		func(r FluxProviderInfo) (string, string) { return r.Namespace, r.Name })
+}
+
+func (m *ClientManager) GetFluxProvider(ctx context.Context, contextName, namespace, name string) (*FluxProviderDetail, error) {
+	obj, err := m.getServedCR(ctx, contextName, fluxProviderGR, namespace, name)
+	if err != nil {
+		return nil, err
+	}
+	info := extractFluxProvider(obj)
+	timeout, _, _ := unstructured.NestedString(obj.Object, "spec", "timeout")
+	proxy, _, _ := unstructured.NestedString(obj.Object, "spec", "proxy")
+	secretRef := nestedRefName(obj, "spec", "secretRef")
+	certSecret := nestedRefName(obj, "spec", "certSecretRef")
+	return &FluxProviderDetail{
+		FluxProviderInfo: info,
+		Conditions:       crConditions(obj),
+		SecretRef:        secretRef,
+		CertSecret:       certSecret,
+		Proxy:            proxy,
+		Timeout:          timeout,
+	}, nil
+}
+
+func extractFluxProvider(obj *unstructured.Unstructured) FluxProviderInfo {
+	conds := crConditions(obj)
+	readyStatus, readyMsg := readyCondition(conds)
+	suspended, _, _ := unstructured.NestedBool(obj.Object, "spec", "suspend")
+	provType, _, _ := unstructured.NestedString(obj.Object, "spec", "type")
+	channel, _, _ := unstructured.NestedString(obj.Object, "spec", "channel")
+	username, _, _ := unstructured.NestedString(obj.Object, "spec", "username")
+	address, _, _ := unstructured.NestedString(obj.Object, "spec", "address")
+	// When address comes from a Secret the spec.address is empty; surface
+	// that explicitly so the UI can render "(from Secret)" instead of an
+	// awkward dash.
+	fromSecret := false
+	if address == "" {
+		if sr, _, _ := nestedMapNoCopy(obj.Object, "spec", "secretRef"); sr != nil {
+			fromSecret = true
+		}
+	}
+	return FluxProviderInfo{
+		Name:              obj.GetName(),
+		Namespace:         obj.GetNamespace(),
+		Ready:             readyStatus,
+		Status:            readyMsg,
+		Suspended:         suspended,
+		Type:              provType,
+		Channel:           channel,
+		Username:          username,
+		Address:           address,
+		AddressFromSecret: fromSecret,
+		CreatedAt:         obj.GetCreationTimestamp().UTC().Format(time.RFC3339),
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Alert (notification.toolkit)
+// ---------------------------------------------------------------------------
+
+// FluxAlertInfo is the row shape for the Alerts view. EventSources is
+// flattened into a Sources string so the table cell stays scannable; the
+// detail dialog still renders the full list.
+type FluxAlertInfo struct {
+	Name        string `json:"name"`
+	Namespace   string `json:"namespace"`
+	Ready       string `json:"ready"`
+	Status      string `json:"status"`
+	Suspended   bool   `json:"suspended"`
+	Provider    string `json:"provider"`
+	Severity    string `json:"severity"`
+	Summary     string `json:"summary"`
+	Sources     string `json:"sources"`
+	SourceCount int    `json:"sourceCount"`
+	CreatedAt   string `json:"createdAt"`
+}
+
+// FluxAlertSource is one row of .spec.eventSources, kept verbose enough
+// for the detail dialog to render a clickable cross-reference to the
+// referenced Flux resource.
+type FluxAlertSource struct {
+	Kind      string `json:"kind"`
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+}
+
+type FluxAlertDetail struct {
+	FluxAlertInfo
+	Conditions    []ConditionDetail `json:"conditions"`
+	EventSources  []FluxAlertSource `json:"eventSources"`
+	InclusionList []string          `json:"inclusionList"`
+	ExclusionList []string          `json:"exclusionList"`
+	EventMetadata map[string]string `json:"eventMetadata"`
+}
+
+func (m *ClientManager) ListFluxAlerts(contextName, namespace string) []FluxAlertInfo {
+	return listServedRows(m, contextName, fluxAlertGR, namespace, extractFluxAlert,
+		func(r FluxAlertInfo) (string, string) { return r.Namespace, r.Name })
+}
+
+func (m *ClientManager) GetFluxAlert(ctx context.Context, contextName, namespace, name string) (*FluxAlertDetail, error) {
+	obj, err := m.getServedCR(ctx, contextName, fluxAlertGR, namespace, name)
+	if err != nil {
+		return nil, err
+	}
+	info := extractFluxAlert(obj)
+	inclusion, _, _ := unstructured.NestedStringSlice(obj.Object, "spec", "inclusionList")
+	exclusion, _, _ := unstructured.NestedStringSlice(obj.Object, "spec", "exclusionList")
+	metadata, _, _ := unstructured.NestedStringMap(obj.Object, "spec", "eventMetadata")
+	if metadata == nil {
+		metadata = map[string]string{}
+	}
+	return &FluxAlertDetail{
+		FluxAlertInfo: info,
+		Conditions:    crConditions(obj),
+		EventSources:  extractFluxObjectRefs(obj, obj.GetNamespace(), "eventSources"),
+		InclusionList: append([]string{}, inclusion...),
+		ExclusionList: append([]string{}, exclusion...),
+		EventMetadata: metadata,
+	}, nil
+}
+
+func extractFluxAlert(obj *unstructured.Unstructured) FluxAlertInfo {
+	conds := crConditions(obj)
+	readyStatus, readyMsg := readyCondition(conds)
+	suspended, _, _ := unstructured.NestedBool(obj.Object, "spec", "suspend")
+	provider := nestedRefName(obj, "spec", "providerRef")
+	severity, _, _ := unstructured.NestedString(obj.Object, "spec", "eventSeverity")
+	summary, _, _ := unstructured.NestedString(obj.Object, "spec", "summary")
+	sources := extractFluxObjectRefs(obj, obj.GetNamespace(), "eventSources")
+	return FluxAlertInfo{
+		Name:        obj.GetName(),
+		Namespace:   obj.GetNamespace(),
+		Ready:       readyStatus,
+		Status:      readyMsg,
+		Suspended:   suspended,
+		Provider:    provider,
+		Severity:    severity,
+		Summary:     summary,
+		Sources:     summariseAlertSources(sources),
+		SourceCount: len(sources),
+		CreatedAt:   obj.GetCreationTimestamp().UTC().Format(time.RFC3339),
+	}
+}
+
+// summariseAlertSources collapses up to two sources into "Kind/name" form
+// for the list cell. More than two get a "+N more" suffix so the column
+// stays a fixed width.
+func summariseAlertSources(sources []FluxAlertSource) string {
+	if len(sources) == 0 {
+		return ""
+	}
+	out := ""
+	for i, s := range sources {
+		if i >= 2 {
+			break
+		}
+		if out != "" {
+			out += ", "
+		}
+		label := s.Kind
+		if s.Name != "" && s.Name != "*" {
+			label += "/" + s.Name
+		} else {
+			label += "/*"
+		}
+		out += label
+	}
+	if len(sources) > 2 {
+		out += fmt.Sprintf(" +%d more", len(sources)-2)
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// Receiver (notification.toolkit)
+// ---------------------------------------------------------------------------
+
+// FluxReceiverInfo is the row shape for the Receivers view. WebhookPath
+// is the cluster-internal URL fragment notification-controller publishes
+// once the receiver is reconciled — the user combines it with their
+// ingress hostname to form the public webhook URL.
+type FluxReceiverInfo struct {
+	Name          string `json:"name"`
+	Namespace     string `json:"namespace"`
+	Ready         string `json:"ready"`
+	Status        string `json:"status"`
+	Suspended     bool   `json:"suspended"`
+	Type          string `json:"type"`
+	WebhookPath   string `json:"webhookPath"`
+	ResourceCount int    `json:"resourceCount"`
+	SecretRef     string `json:"secretRef"`
+	CreatedAt     string `json:"createdAt"`
+}
+
+type FluxReceiverDetail struct {
+	FluxReceiverInfo
+	Conditions []ConditionDetail `json:"conditions"`
+	Events     []string          `json:"events"`
+	Resources  []FluxAlertSource `json:"resources"`
+	Interval   string            `json:"interval"`
+}
+
+func (m *ClientManager) ListFluxReceivers(contextName, namespace string) []FluxReceiverInfo {
+	return listServedRows(m, contextName, fluxReceiverGR, namespace, extractFluxReceiver,
+		func(r FluxReceiverInfo) (string, string) { return r.Namespace, r.Name })
+}
+
+func (m *ClientManager) GetFluxReceiver(ctx context.Context, contextName, namespace, name string) (*FluxReceiverDetail, error) {
+	obj, err := m.getServedCR(ctx, contextName, fluxReceiverGR, namespace, name)
+	if err != nil {
+		return nil, err
+	}
+	info := extractFluxReceiver(obj)
+	events, _, _ := unstructured.NestedStringSlice(obj.Object, "spec", "events")
+	interval, _, _ := unstructured.NestedString(obj.Object, "spec", "interval")
+	return &FluxReceiverDetail{
+		FluxReceiverInfo: info,
+		Conditions:       crConditions(obj),
+		Events:           append([]string{}, events...),
+		Resources:        extractFluxObjectRefs(obj, obj.GetNamespace(), "resources"),
+		Interval:         interval,
+	}, nil
+}
+
+func extractFluxReceiver(obj *unstructured.Unstructured) FluxReceiverInfo {
+	conds := crConditions(obj)
+	readyStatus, readyMsg := readyCondition(conds)
+	suspended, _, _ := unstructured.NestedBool(obj.Object, "spec", "suspend")
+	recvType, _, _ := unstructured.NestedString(obj.Object, "spec", "type")
+	// .status.webhookPath shows up only after the receiver becomes Ready
+	// — that's by design: the path is derived from the receiver's token.
+	webhookPath, _, _ := unstructured.NestedString(obj.Object, "status", "webhookPath")
+	secretRef := nestedRefName(obj, "spec", "secretRef")
+	resources := extractFluxObjectRefs(obj, obj.GetNamespace(), "resources")
+	return FluxReceiverInfo{
+		Name:          obj.GetName(),
+		Namespace:     obj.GetNamespace(),
+		Ready:         readyStatus,
+		Status:        readyMsg,
+		Suspended:     suspended,
+		Type:          recvType,
+		WebhookPath:   webhookPath,
+		ResourceCount: len(resources),
+		SecretRef:     secretRef,
+		CreatedAt:     obj.GetCreationTimestamp().UTC().Format(time.RFC3339),
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Mutations: Reconcile, Suspend/Resume
+// ---------------------------------------------------------------------------
+
+// ReconcileFluxResource flips the reconcile.fluxcd.io/requestedAt annotation
+// to a fresh RFC3339Nano timestamp. The Flux controller for this kind picks
+// it up on its next sync poll (interval ≤ a few seconds typically) and
+// reconciles immediately, the same path `flux reconcile <kind> <name>` uses.
+func (m *ClientManager) ReconcileFluxResource(ctx context.Context, contextName, kind, namespace, name string) error {
+	if kind == "FluxImagePolicy" {
+		return fmt.Errorf("reconcile the ImagePolicy's ImageRepository to refresh its tags")
+	}
+	gr, err := fluxActionResource(kind)
+	if err != nil {
+		return err
+	}
+	patch := map[string]any{
+		"metadata": map[string]any{
+			"annotations": map[string]any{
+				fluxReconcileAnnotation: time.Now().UTC().Format(time.RFC3339Nano),
+			},
+		},
+	}
+	if err := m.mergePatchCR(ctx, contextName, gr, namespace, name, patch); err != nil {
+		return fmt.Errorf("reconcile %s %s/%s: %w", kind, namespace, name, err)
+	}
+	return nil
+}
+
+// SetFluxResourceSuspended toggles .spec.suspend. While suspended, the
+// controller leaves the resource alone — useful for taking a managed
+// workload offline temporarily without deleting the Flux object.
+func (m *ClientManager) SetFluxResourceSuspended(ctx context.Context, contextName, kind, namespace, name string, suspended bool) error {
+	gr, err := fluxActionResource(kind)
+	if err != nil {
+		return err
+	}
+	// spec.suspend arrived in ImagePolicy with image.toolkit.fluxcd.io/v1.
+	if gvr, ok := m.servedGVR(contextName, gr); kind == "FluxImagePolicy" && ok && gvr.Version != "v1" {
+		return fmt.Errorf("suspending ImagePolicy requires image.toolkit.fluxcd.io/v1")
+	}
+	patch := map[string]any{
+		"spec": map[string]any{
+			"suspend": suspended,
+		},
+	}
+	if err := m.mergePatchCR(ctx, contextName, gr, namespace, name, patch); err != nil {
+		return fmt.Errorf("suspend %s %s/%s: %w", kind, namespace, name, err)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+// nestedRefName reads the ".name" of a Flux object reference (secretRef,
+// certSecretRef, providerRef, …) at the given path, returning "" when absent.
+func nestedRefName(obj *unstructured.Unstructured, fields ...string) string {
+	if ref, _, _ := nestedMapNoCopy(obj.Object, fields...); ref != nil {
+		name, _ := ref["name"].(string)
+		return name
+	}
+	return ""
+}
+
+// extractFluxObjectRefs projects a spec list of {kind,name,namespace} object
+// references (Alert .spec.eventSources, Receiver .spec.resources) into
+// FluxAlertSource rows, defaulting an omitted namespace to the parent's.
+func extractFluxObjectRefs(obj *unstructured.Unstructured, parentNS, specKey string) []FluxAlertSource {
+	raw, found, _ := nestedSliceNoCopy(obj.Object, "spec", specKey)
+	if !found {
+		return []FluxAlertSource{}
+	}
+	out := make([]FluxAlertSource, 0, len(raw))
+	for _, item := range raw {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		kind, _ := m["kind"].(string)
+		name, _ := m["name"].(string)
+		ns, _ := m["namespace"].(string)
+		if ns == "" {
+			ns = parentNS
+		}
+		if kind == "" {
+			continue
+		}
+		out = append(out, FluxAlertSource{Kind: kind, Name: name, Namespace: ns})
+	}
+	return out
+}
+
+// formatSourceRef collapses a Flux sourceRef block (kind+name, optionally
+// namespace) into the "Kind/namespace/name" or "Kind/name" form Klustr
+// renders inline. parentNS is the namespace of the owning CR — Flux treats
+// sourceRef.namespace as a same-namespace default when omitted.
+func formatSourceRef(ref map[string]any, parentNS string) string {
+	if ref == nil {
+		return ""
+	}
+	kind, _ := ref["kind"].(string)
+	name, _ := ref["name"].(string)
+	ns, _ := ref["namespace"].(string)
+	if name == "" {
+		return ""
+	}
+	if ns == "" || ns == parentNS {
+		if kind == "" {
+			return name
+		}
+		return kind + "/" + name
+	}
+	if kind == "" {
+		return ns + "/" + name
+	}
+	return kind + "/" + ns + "/" + name
+}
+
+// extractDependsOnRefs flattens .spec.dependsOn[] entries (which are
+// objects with name + optional namespace) into "namespace/name" strings.
+// Returns empty slice (not nil) for JSON friendliness.
+func extractDependsOnRefs(raw []any) []string {
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := m["name"].(string)
+		if name == "" {
+			continue
+		}
+		ns, _ := m["namespace"].(string)
+		if ns == "" {
+			out = append(out, name)
+		} else {
+			out = append(out, ns+"/"+name)
+		}
+	}
+	return out
+}

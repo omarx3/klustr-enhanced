@@ -1,0 +1,386 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Manual runs build and sign artifacts but never publish: the release job is
+  # gated on a tag ref. Use this to check that a branch still builds and signs
+  # on both platforms, not to cut a release.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or SHA to build (artifacts only, no release)"
+        required: false
+
+permissions:
+  contents: read
+
+# Serialize releases so two quick tags can't race the Homebrew tap / AUR
+# pushes. Never cancel an in-flight release mid-publish — queue behind it.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build ${{ matrix.label }}
+    needs: verify
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # On macOS runners, bare labels are arm64 while -large is Intel.
+          # macos-latest points here today; pinning removes the ambiguity
+          # during the next alias migration, when either image can answer.
+          - os: macos-26
+            label: macOS (Apple Silicon)
+            platform: darwin/arm64
+            suffix: darwin-arm64.tar.gz
+          # Not code-signed yet: SignPath's free signing for open source
+          # projects takes only a project that already ships the binary.
+          - os: windows-latest
+            label: Windows (amd64)
+            platform: windows/amd64
+            suffix: windows-amd64.zip
+          - os: ubuntu-24.04
+            label: Linux (amd64)
+            platform: linux/amd64
+            suffix: linux-amd64.tar.gz
+            tags: webkit2_41
+    runs-on: ${{ matrix.os }}
+    environment: release
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # The CLI generates the bindings the wails/v2 library consumes at runtime,
+      # so it must track the module version rather than a hand-written pin.
+      - name: Resolve Wails CLI version
+        id: wails
+        shell: bash
+        run: |
+          echo "version=$(go list -m -f '{{.Version}}' github.com/wailsapp/wails/v2)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Wails CLI
+        id: wails-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/go/bin/wails
+            ~/go/bin/wails.exe
+          key: wails-cli-${{ steps.wails.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install Wails CLI
+        if: steps.wails-cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          WAILS_VERSION: ${{ steps.wails.outputs.version }}
+        run: go install "github.com/wailsapp/wails/v2/cmd/wails@${WAILS_VERSION}"
+
+      - uses: ./.github/actions/linux-build-deps
+        if: matrix.os == 'ubuntu-24.04'
+
+      - name: Resolve version and artifact name
+        id: meta
+        shell: bash
+        env:
+          SUFFIX: ${{ matrix.suffix }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION="v0.0.0-dev"
+          fi
+          # A tag matching v* is free-form text that ends up in artifact names
+          # and in $GITHUB_OUTPUT. Reject anything that isn't a release version
+          # before it gets that far.
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "Refusing to build unexpected version: $VERSION" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "name=klustr-${VERSION}-${SUFFIX}" >> "$GITHUB_OUTPUT"
+          # The bundle and exe version fields hold numbers only: macOS wants
+          # three integers in CFBundleShortVersionString, and a Windows
+          # VERSIONINFO file version can't carry a prerelease suffix.
+          APP_VERSION="${VERSION#v}"
+          APP_VERSION="${APP_VERSION%%-*}"
+          echo "app_version=${APP_VERSION}" >> "$GITHUB_OUTPUT"
+          # SemVer's '-' prerelease separator is Debian's *revision* separator,
+          # so dpkg ranks 1.2.3-rc.1 above 1.2.3. '~' sorts before everything,
+          # even end-of-string. nfpm already applies this to the control field;
+          # mirror it here or the filename disagrees with the package inside.
+          # The escape matters: a bare ~ in the replacement is tilde-expanded.
+          DEB_VERSION="${VERSION#v}"
+          DEB_VERSION="${DEB_VERSION/-/\~}"
+          echo "deb_version=${DEB_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "deb_name=klustr_${DEB_VERSION}_amd64.deb" >> "$GITHUB_OUTPUT"
+
+      # wails.json holds a placeholder; Wails fills the macOS Info.plist and
+      # the Windows version resource from it.
+      - name: Stamp app version
+        shell: bash
+        env:
+          APP_VERSION: ${{ steps.meta.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          jq --arg v "$APP_VERSION" '.info.productVersion = $v' wails.json > wails.json.tmp
+          mv wails.json.tmp wails.json
+
+      - name: Build
+        shell: bash
+        env:
+          KLUSTR_VERSION: ${{ steps.meta.outputs.version }}
+          BUILD_TAGS: ${{ matrix.tags }}
+          BUILD_PLATFORM: ${{ matrix.platform }}
+        run: |
+          TAGS_ARG=""
+          if [ -n "$BUILD_TAGS" ]; then
+            TAGS_ARG="-tags $BUILD_TAGS"
+          fi
+          wails build \
+            $TAGS_ARG \
+            -platform "$BUILD_PLATFORM" \
+            -ldflags "-X klustr/app.Version=${KLUSTR_VERSION}" \
+            -trimpath \
+            -clean
+
+      - name: Import code-signing certificate
+        if: startsWith(matrix.os, 'macos')
+        uses: Apple-actions/import-codesign-certs@77ba2a2a8f5cfc8c405ebf3159f767c323e238f9 # v7.1.0
+        with:
+          p12-file-base64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          p12-password: ${{ secrets.MACOS_CERT_PASSWORD }}
+
+      - name: Sign macOS app
+        if: startsWith(matrix.os, 'macos')
+        shell: bash
+        run: |
+          IDENTITY=$(security find-identity -v -p codesigning | awk '/Developer ID Application/ { print $2; exit }')
+          if [ -z "$IDENTITY" ]; then
+            echo "No Developer ID Application identity found in keychain" >&2
+            exit 1
+          fi
+          codesign --force --timestamp --options runtime \
+            --entitlements build/darwin/entitlements.plist \
+            --sign "$IDENTITY" build/bin/klustr.app
+          codesign --verify --strict --verbose=2 build/bin/klustr.app
+
+      - name: Notarize macOS app
+        if: startsWith(matrix.os, 'macos')
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+          APPLE_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+        run: |
+          ditto -c -k --keepParent build/bin/klustr.app notarize.zip
+          xcrun notarytool submit notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --team-id "$TEAM_ID" \
+            --password "$APPLE_PASSWORD" \
+            --wait --timeout 30m
+          xcrun stapler staple build/bin/klustr.app
+          rm -f notarize.zip
+
+      # codesign --verify above only inspects the signature. These answer the
+      # two questions it cannot: did the ticket actually attach, and is this
+      # the architecture the artifact name promises. spctl --assess is
+      # deliberately absent — it rejects on Gatekeeper policy grounds that
+      # have nothing to do with a broken build.
+      - name: Verify macOS bundle
+        if: startsWith(matrix.os, 'macos')
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun stapler validate build/bin/klustr.app
+          lipo build/bin/klustr.app/Contents/MacOS/klustr -verify_arch arm64
+          [ "$(lipo -archs build/bin/klustr.app/Contents/MacOS/klustr)" = "arm64" ]
+
+      - name: Package macOS
+        if: startsWith(matrix.os, 'macos')
+        shell: bash
+        env:
+          ARTIFACT: ${{ steps.meta.outputs.name }}
+          # bsdtar otherwise stores an AppleDouble ._ entry beside every file.
+          COPYFILE_DISABLE: "1"
+        run: |
+          cd build/bin
+          # Beside the bundle, not inside it: the bundle is already signed and
+          # notarized, and any file added to it would break the seal.
+          cp ../../LICENSE ../../NOTICE .
+          tar -czf "$ARTIFACT" klustr.app LICENSE NOTICE
+
+      - name: Package Windows
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          ARTIFACT: ${{ steps.meta.outputs.name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location build/bin
+          Copy-Item ../../LICENSE, ../../NOTICE .
+          Compress-Archive -Path klustr.exe, LICENSE, NOTICE -DestinationPath $env:ARTIFACT
+
+      # A console-subsystem build would open a terminal window beside the
+      # app, and a missed stamp shows Wails' 1.0.0 in the file properties.
+      - name: Verify Windows package
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          ARTIFACT: ${{ steps.meta.outputs.name }}
+          APP_VERSION: ${{ steps.meta.outputs.app_version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = [IO.File]::ReadAllBytes('build/bin/klustr.exe')
+          $pe = [BitConverter]::ToInt32($exe, 0x3C)
+          if ([Text.Encoding]::ASCII.GetString($exe, $pe, 4) -ne "PE`0`0") { throw 'klustr.exe is not a PE image' }
+          if ([BitConverter]::ToUInt16($exe, $pe + 4) -ne 0x8664) { throw 'klustr.exe is not x86-64' }
+          # Subsystem sits 68 bytes into the optional header; 2 is Windows GUI.
+          if ([BitConverter]::ToUInt16($exe, $pe + 24 + 68) -ne 2) { throw 'klustr.exe is not a GUI executable' }
+          $version = (Get-Item build/bin/klustr.exe).VersionInfo.ProductVersion
+          if ($version -ne $env:APP_VERSION) { throw "klustr.exe ProductVersion is '$version', want '$env:APP_VERSION'" }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [IO.Compression.ZipFile]::OpenRead("build/bin/$env:ARTIFACT")
+          try { $names = @($zip.Entries.FullName) } finally { $zip.Dispose() }
+          foreach ($want in 'klustr.exe', 'LICENSE', 'NOTICE') {
+            if ($names -notcontains $want) { throw "$env:ARTIFACT lacks $want" }
+          }
+
+      - name: Package Linux
+        if: matrix.os == 'ubuntu-24.04'
+        shell: bash
+        env:
+          ARTIFACT: ${{ steps.meta.outputs.name }}
+        run: |
+          cd build/bin
+          cp ../../LICENSE ../../NOTICE .
+          tar -czf "$ARTIFACT" klustr LICENSE NOTICE
+
+      - name: Build Linux .deb
+        if: matrix.os == 'ubuntu-24.04'
+        shell: bash
+        env:
+          NFPM_VERSION: "2.46.3"
+          VERSION: ${{ steps.meta.outputs.deb_version }}
+          DEB_NAME: ${{ steps.meta.outputs.deb_name }}
+        run: |
+          set -euo pipefail
+          # go install verifies against sum.golang.org, which a GitHub release
+          # asset cannot offer: an asset can be replaced under its own tag.
+          go install "github.com/goreleaser/nfpm/v2/cmd/nfpm@v${NFPM_VERSION}"
+          nfpm package \
+            --config build/linux/nfpm.yaml \
+            --packager deb \
+            --target "build/bin/${DEB_NAME}"
+
+      - name: Verify Linux packages
+        if: matrix.os == 'ubuntu-24.04'
+        shell: bash
+        env:
+          ARTIFACT: ${{ steps.meta.outputs.name }}
+          DEB_NAME: ${{ steps.meta.outputs.deb_name }}
+          DEB_VERSION: ${{ steps.meta.outputs.deb_version }}
+        run: |
+          set -euo pipefail
+          file build/bin/klustr | grep -q 'ELF 64-bit LSB.*x86-64'
+          # grep must drain tar and dpkg-deb output; -q closes the pipe early
+          # under pipefail.
+          tar -tzf "build/bin/${ARTIFACT}" | grep -x klustr >/dev/null
+          tar -tzf "build/bin/${ARTIFACT}" | grep -x LICENSE >/dev/null
+          tar -tzf "build/bin/${ARTIFACT}" | grep -x NOTICE >/dev/null
+          dpkg-deb --info "build/bin/${DEB_NAME}"
+          dpkg-deb --contents "build/bin/${DEB_NAME}" | grep -F './usr/bin/klustr' >/dev/null
+          dpkg-deb --contents "build/bin/${DEB_NAME}" | grep -F './usr/share/doc/klustr/LICENSE' >/dev/null
+          dpkg-deb --contents "build/bin/${DEB_NAME}" | grep -F './usr/share/doc/klustr/NOTICE' >/dev/null
+          # The filename and the control field must agree, and a prerelease
+          # must sort below the release it precedes.
+          PKG_VERSION=$(dpkg-deb --field "build/bin/${DEB_NAME}" Version)
+          [ "$PKG_VERSION" = "$DEB_VERSION" ]
+          BASE="${DEB_VERSION%%[~+]*}"
+          if [ "$DEB_VERSION" != "$BASE" ]; then
+            dpkg --compare-versions "$DEB_VERSION" lt "$BASE"
+          fi
+
+      # The archives and the .deb are already compressed, and these only need
+      # to outlive a re-run of the release job.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.meta.outputs.name }}
+          path: build/bin/${{ steps.meta.outputs.name }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - if: matrix.os == 'ubuntu-24.04'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.meta.outputs.deb_name }}
+          path: build/bin/${{ steps.meta.outputs.deb_name }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  release:
+    name: Publish release
+    timeout-minutes: 15
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum klustr-*.tar.gz klustr-*.zip klustr_*.deb > SHA256SUMS
+          cat SHA256SUMS
+
+      # Checksums catch a truncated download; provenance is what ties a binary
+      # to the commit and workflow run that produced it.
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            artifacts/klustr-*.tar.gz
+            artifacts/klustr-*.zip
+            artifacts/klustr_*.deb
+
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: |
+            artifacts/klustr-*-darwin-arm64.tar.gz
+            artifacts/klustr-*-linux-amd64.tar.gz
+            artifacts/klustr_*_amd64.deb
+            artifacts/klustr-*-windows-amd64.zip
+            artifacts/SHA256SUMS
+          generate_release_notes: true
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
