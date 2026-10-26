@@ -201,41 +201,65 @@ func sanitizeForYAML(obj *unstructured.Unstructured) {
 	unstructured.RemoveNestedField(obj.Object, "status")
 }
 
-func (m *ClientManager) ApplyResourceYAML(ctx context.Context, contextName, yamlBody string) error {
+// ApplyResourceYAML server-side applies an edited manifest. When the object
+// already exists, its live state is first saved to the backup directory and
+// the backup's path is returned; the edit is refused if that backup cannot be
+// written, so no change goes through without a way back. A create returns "".
+func (m *ClientManager) ApplyResourceYAML(ctx context.Context, contextName, yamlBody string) (string, error) {
 	if err := m.assertWritable(contextName); err != nil {
-		return err
+		return "", err
 	}
 	obj := &unstructured.Unstructured{}
 	if err := yaml.Unmarshal([]byte(yamlBody), &obj.Object); err != nil {
-		return fmt.Errorf("invalid YAML: %w", err)
+		return "", fmt.Errorf("invalid YAML: %w", err)
 	}
 	gvk := obj.GroupVersionKind()
 	if gvk.Kind == "" {
-		return fmt.Errorf("YAML missing kind")
+		return "", fmt.Errorf("YAML missing kind")
 	}
 	gvr, err := m.resolveGVK(contextName, gvk)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	dyn, err := m.dynamicClient(contextName)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	data, err := yaml.YAMLToJSON([]byte(yamlBody))
 	if err != nil {
-		return fmt.Errorf("yaml→json: %w", err)
+		return "", fmt.Errorf("yaml→json: %w", err)
 	}
+	ri := resourceFor(dyn, gvr, obj.GetNamespace())
+
+	backup := ""
+	live, err := ri.Get(ctx, obj.GetName(), metav1.GetOptions{})
+	switch {
+	case err == nil:
+		dir, derr := m.backupDirectory()
+		if derr != nil {
+			return "", fmt.Errorf("backup failed, change not applied: %w", derr)
+		}
+		if backup, err = writeResourceBackup(dir, contextName, live, time.Now()); err != nil {
+			return "", fmt.Errorf("backup failed, change not applied: %w", err)
+		}
+	case !apierrors.IsNotFound(err):
+		return "", err
+	}
+
 	force := true
-	_, err = resourceFor(dyn, gvr, obj.GetNamespace()).Patch(
+	_, err = ri.Patch(
 		ctx,
 		obj.GetName(),
 		types.ApplyPatchType,
 		data,
 		metav1.PatchOptions{FieldManager: "klustr", Force: &force},
 	)
-	return err
+	if err != nil {
+		return "", err
+	}
+	return backup, nil
 }
 
 // MutationDiff is the preview shown before a YAML apply. Before is the live

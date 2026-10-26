@@ -298,6 +298,7 @@ export type ReplicaSetDetail = kube.ReplicaSetDetail
 export type ReplicaSetInfo = kube.ReplicaSetInfo
 export type ReplicationControllerDetail = kube.ReplicationControllerDetail
 export type ReplicationControllerInfo = kube.ReplicationControllerInfo
+export type ResourceBackup = kube.ResourceBackup
 export type ResourceClaimDetail = kube.ResourceClaimDetail
 export type ResourceClaimInfo = kube.ResourceClaimInfo
 export type ResourceClaimTemplateDetail = kube.ResourceClaimTemplateDetail
@@ -653,6 +654,7 @@ export const generatedApi = {
   listReferenceGrants: bindings.ListReferenceGrants,
   listReplicaSets: bindings.ListReplicaSets,
   listReplicationControllers: bindings.ListReplicationControllers,
+  listResourceBackups: bindings.ListResourceBackups,
   listResourceClaimTemplates: bindings.ListResourceClaimTemplates,
   listResourceClaims: bindings.ListResourceClaims,
   listResourceQuotas: bindings.ListResourceQuotas,
@@ -695,6 +697,7 @@ export const generatedApi = {
   podsForOwner: bindings.PodsForOwner,
   policyReportForResource: bindings.PolicyReportForResource,
   policyViolationsFor: bindings.PolicyViolationsFor,
+  readResourceBackup: bindings.ReadResourceBackup,
   recommendInsecureKubeletTLS: bindings.RecommendInsecureKubeletTLS,
   reconcileFluxResource: bindings.ReconcileFluxResource,
   refreshArgoApplication: bindings.RefreshArgoApplication,

@@ -92,6 +92,8 @@ type ClientManager struct {
 	creds       *credentialManager
 	appCtx      context.Context
 	credRewatch map[string]bool
+	// backupDir overrides ~/klustr-backup; tests point it at a temp dir.
+	backupDir string
 }
 
 func NewClientManager() *ClientManager {

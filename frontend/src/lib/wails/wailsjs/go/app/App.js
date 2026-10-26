@@ -1086,6 +1086,10 @@ export function ListReplicationControllers(arg1, arg2) {
   return window['go']['app']['App']['ListReplicationControllers'](arg1, arg2);
 }
 
+export function ListResourceBackups(arg1, arg2, arg3, arg4) {
+  return window['go']['app']['App']['ListResourceBackups'](arg1, arg2, arg3, arg4);
+}
+
 export function ListResourceClaimTemplates(arg1, arg2) {
   return window['go']['app']['App']['ListResourceClaimTemplates'](arg1, arg2);
 }
@@ -1252,6 +1256,10 @@ export function PolicyReportForResource(arg1, arg2, arg3, arg4) {
 
 export function PolicyViolationsFor(arg1, arg2) {
   return window['go']['app']['App']['PolicyViolationsFor'](arg1, arg2);
+}
+
+export function ReadResourceBackup(arg1) {
+  return window['go']['app']['App']['ReadResourceBackup'](arg1);
 }
 
 export function RecommendInsecureKubeletTLS(arg1) {

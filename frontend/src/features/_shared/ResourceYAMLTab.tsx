@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
-import { RefreshCw } from 'lucide-react'
+import { RefreshCw, Search } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import {
@@ -12,13 +12,15 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { parseDocument } from 'yaml'
-import { api, type MutationDiff } from '@/lib/api'
+import { api, type MutationDiff, type ResourceBackup } from '@/lib/api'
 import { deltaTouches, onKubeChange } from '@/lib/events'
 import { useUIStore } from '@/store/ui'
 import { Spinner } from '@/components/ui/spinner'
 import { CopyButton } from './Copyable'
 import { GitOpsRevertWarning } from './GitOpsRevertWarning'
+import { RestoreBackupMenu } from './RestoreBackupMenu'
 import { useManagers } from './useResourceManagers'
+import { YAMLSearchBar, type SearchableEditor } from './YAMLSearchBar'
 
 const Editor = lazy(() => import('@/lib/monaco').then((m) => ({ default: m.Editor })))
 const DiffEditor = lazy(() =>
@@ -62,6 +64,13 @@ export function ResourceYAMLTab({ contextName, kind, namespace, name, gvr }: Pro
   const [refreshing, setRefreshing] = useState(false)
   const [stale, setStale] = useState(false)
   const [diffOpen, setDiffOpen] = useState(false)
+  const [searchOpen, setSearchOpen] = useState(false)
+  const [searchFocus, setSearchFocus] = useState(0)
+  const [editorApi, setEditorApi] = useState<SearchableEditor | null>(null)
+  const openSearch = useCallback(() => {
+    setSearchOpen(true)
+    setSearchFocus((n) => n + 1)
+  }, [])
   const requestRef = useRef(0)
   const gvrGroup = gvr?.group ?? ''
   const gvrVersion = gvr?.version ?? ''
@@ -131,15 +140,28 @@ export function ResourceYAMLTab({ contextName, kind, namespace, name, gvr }: Pro
   const apply = useMutation({
     mutationFn: async () => {
       if (!contextName) throw new Error('no context')
-      await api.applyResourceYAML(contextName, draft)
+      return api.applyResourceYAML(contextName, draft)
     },
-    onSuccess: () => {
-      toast.success(`Applied ${kind.toLowerCase()}/${name}`)
+    onSuccess: (backupPath) => {
+      toast.success(`Applied ${kind.toLowerCase()}/${name}`, {
+        description: backupPath ? `Previous version saved to ${backupPath}` : undefined,
+      })
       setSource(draft)
       setEditing(false)
       setDiffOpen(false)
     },
   })
+
+  // A restore is an edit like any other: it loads the backup into the draft
+  // and the user reviews the server dry-run before anything is written.
+  const restoreBackup = (manifest: string, backup: ResourceBackup) => {
+    apply.reset()
+    setDraft(manifest)
+    setEditing(true)
+    toast.info(`Loaded backup from ${new Date(backup.takenAt).toLocaleString()}`, {
+      description: 'Review & apply to restore it.',
+    })
+  }
 
   const openReview = () => {
     apply.reset()
@@ -250,6 +272,26 @@ export function ResourceYAMLTab({ contextName, kind, namespace, name, gvr }: Pro
         <span className="ml-auto text-muted-foreground">
           {editing && dirty ? '● unsaved changes' : null}
         </span>
+        <RestoreBackupMenu
+          contextName={contextName}
+          kind={kind}
+          namespace={namespace}
+          name={name}
+          disabled={!loaded || !!loadError || readOnly || apply.isPending}
+          onRestore={restoreBackup}
+        />
+        <Button
+          type="button"
+          size="xs"
+          variant={searchOpen ? 'secondary' : 'outline'}
+          onClick={() => (searchOpen ? setSearchOpen(false) : openSearch())}
+          disabled={!loaded || !!loadError}
+          aria-pressed={searchOpen}
+          title="Search YAML (Ctrl+F)"
+        >
+          <Search className="size-3" />
+          Search
+        </Button>
         {loaded && !loadError && (
           <CopyButton
             value={editing ? draft : source}
@@ -283,6 +325,14 @@ export function ResourceYAMLTab({ contextName, kind, namespace, name, gvr }: Pro
           {String(apply.error)}
         </div>
       )}
+      {searchOpen && loaded && !loadError && (
+        <YAMLSearchBar
+          editor={editorApi}
+          text={editing ? draft : source}
+          focusRequest={searchFocus}
+          onClose={() => setSearchOpen(false)}
+        />
+      )}
       <div className="min-h-0 flex-1">
         <Suspense fallback={<div className="flex h-full items-center justify-center text-xs text-muted-foreground">Loading editor…</div>}>
           {loaded && !loadError && (
@@ -291,6 +341,12 @@ export function ResourceYAMLTab({ contextName, kind, namespace, name, gvr }: Pro
               language="yaml"
               value={editing ? draft : source}
               onChange={(v) => setDraft(v ?? '')}
+              onMount={(ed, monaco) => {
+                setEditorApi(ed as unknown as SearchableEditor)
+                // Ctrl/Cmd+F opens this search bar instead of Monaco's own
+                // find widget, so there is one search with one behavior.
+                ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyF, openSearch)
+              }}
               theme={theme === 'dark' ? 'vs-dark' : 'vs-light'}
               options={{
                 readOnly: !editing,

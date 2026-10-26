@@ -5,7 +5,7 @@ import {update} from '../models';
 
 export function AddHelmRepo(arg1:string,arg2:string):Promise<void>;
 
-export function ApplyResourceYAML(arg1:string,arg2:string):Promise<void>;
+export function ApplyResourceYAML(arg1:string,arg2:string):Promise<string>;
 
 export function ApproveCertificateSigningRequest(arg1:string,arg2:string,arg3:string):Promise<void>;
 
@@ -545,6 +545,8 @@ export function ListReplicaSets(arg1:string,arg2:string):Promise<Array<kube.Repl
 
 export function ListReplicationControllers(arg1:string,arg2:string):Promise<Array<kube.ReplicationControllerInfo>>;
 
+export function ListResourceBackups(arg1:string,arg2:string,arg3:string,arg4:string):Promise<Array<kube.ResourceBackup>>;
+
 export function ListResourceClaimTemplates(arg1:string,arg2:string):Promise<Array<kube.ResourceClaimTemplateInfo>>;
 
 export function ListResourceClaims(arg1:string,arg2:string):Promise<Array<kube.ResourceClaimInfo>>;
@@ -628,6 +630,8 @@ export function PodsForOwner(arg1:string,arg2:string,arg3:string,arg4:string):Pr
 export function PolicyReportForResource(arg1:string,arg2:string,arg3:string,arg4:string):Promise<kube.PolicyReportDetail>;
 
 export function PolicyViolationsFor(arg1:string,arg2:string):Promise<Array<kube.PolicyViolation>>;
+
+export function ReadResourceBackup(arg1:string):Promise<string>;
 
 export function RecommendInsecureKubeletTLS(arg1:string):Promise<boolean>;
 

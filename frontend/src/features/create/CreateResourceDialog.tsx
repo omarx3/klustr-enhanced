@@ -17,6 +17,7 @@ import { useContextLabel, useUIStore, type ResourceKind, type SelectedResource }
 import { useThemeMode } from '@/features/_shared/useThemeMode'
 import { useScaledFontSize } from '@/features/_shared/useFontScale'
 import { hasErrors, validateManifest, type ManifestIssue } from './validateManifest'
+import { YAMLSearchBar, type SearchableEditor } from '@/features/_shared/YAMLSearchBar'
 
 const Editor = lazy(() => import('@/lib/monaco').then((m) => ({ default: m.Editor })))
 
@@ -77,6 +78,8 @@ export function CreateResourceDialog({ target, onClose }: Props) {
   const [serverError, setServerError] = useState<string | null>(null)
   const [confirmWarnings, setConfirmWarnings] = useState(false)
   const editorRef = useRef<CodeEditor | null>(null)
+  const [searchEditor, setSearchEditor] = useState<SearchableEditor | null>(null)
+  const [searchFocus, setSearchFocus] = useState(0)
   const monacoRef = useRef<MonacoApi | null>(null)
   const [mounted, setMounted] = useState(0)
 
@@ -210,6 +213,7 @@ export function CreateResourceDialog({ target, onClose }: Props) {
           </DialogDescription>
         </DialogHeader>
 
+        <YAMLSearchBar editor={searchEditor} text={text} focusRequest={searchFocus} />
         <div className="min-h-0 flex-1">
           <Suspense
             fallback={
@@ -224,6 +228,8 @@ export function CreateResourceDialog({ target, onClose }: Props) {
               onMount={(ed, monaco) => {
                 editorRef.current = ed as unknown as CodeEditor
                 monacoRef.current = monaco as unknown as MonacoApi
+                setSearchEditor(ed as unknown as SearchableEditor)
+                ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyF, () => setSearchFocus((n) => n + 1))
                 ed.focus()
                 // The marker effect needs the model, which exists only now.
                 setMounted((n) => n + 1)

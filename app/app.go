@@ -303,8 +303,18 @@ func (a *App) GetResourceYAML(contextName, kind, namespace, name string) (string
 	return a.clients.GetResourceYAML(a.ctx, contextName, kind, namespace, name)
 }
 
-func (a *App) ApplyResourceYAML(contextName, yamlBody string) error {
+// ApplyResourceYAML applies an edited manifest and returns the path of the
+// backup taken of the live object first ("" when the apply created it).
+func (a *App) ApplyResourceYAML(contextName, yamlBody string) (string, error) {
 	return a.clients.ApplyResourceYAML(a.ctx, contextName, yamlBody)
+}
+
+func (a *App) ListResourceBackups(contextName, kind, namespace, name string) ([]kube.ResourceBackup, error) {
+	return a.clients.ListResourceBackups(contextName, kind, namespace, name)
+}
+
+func (a *App) ReadResourceBackup(file string) (string, error) {
+	return a.clients.ReadResourceBackup(file)
 }
 
 func (a *App) DryRunApplyResourceYAML(contextName, yamlBody string) (*kube.MutationDiff, error) {

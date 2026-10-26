@@ -23,6 +23,9 @@ const mocks = vi.hoisted(() => {
     eventState,
     getResourceYAML: vi.fn(),
     getCustomResourceYAML: vi.fn(),
+    listResourceBackups: vi.fn(),
+    readResourceBackup: vi.fn(),
+    applyResourceYAML: vi.fn(),
     onKubeChange: vi.fn((_kind: string, handler: ChangeHandler) => {
       eventState.handler = handler
       return vi.fn()
@@ -35,7 +38,9 @@ vi.mock('@/lib/api', () => ({
     getResourceYAML: mocks.getResourceYAML,
     getCustomResourceYAML: mocks.getCustomResourceYAML,
     dryRunApplyResourceYAML: vi.fn(),
-    applyResourceYAML: vi.fn(),
+    applyResourceYAML: mocks.applyResourceYAML,
+    listResourceBackups: mocks.listResourceBackups,
+    readResourceBackup: mocks.readResourceBackup,
   },
 }))
 
@@ -67,6 +72,7 @@ vi.mock('sonner', () => ({
   toast: {
     error: vi.fn(),
     success: vi.fn(),
+    info: vi.fn(),
   },
 }))
 
@@ -224,5 +230,45 @@ describe('ResourceYAMLTab', () => {
     expect(mocks.setDetailDirty).toHaveBeenLastCalledWith(false)
     expect(container.textContent).not.toContain('# edited')
     expect(button(container, 'Edit')).toBeTruthy()
+  })
+
+  it('restoring a backup loads it as a draft to review, without applying it', async () => {
+    mocks.getResourceYAML.mockResolvedValue('kind: Pod\nspec: new\n')
+    mocks.listResourceBackups.mockResolvedValue([
+      { file: 'api-pod-2026-10-26_09-30-00.yaml', context: 'test-context', kind: 'Pod', namespace: 'default', name: 'api', takenAt: '2026-10-26T09:30:00Z' },
+    ])
+    mocks.readResourceBackup.mockResolvedValue('kind: Pod\nspec: old\n')
+    const queryClient = new QueryClient()
+    await act(async () => root.render(<QueryClientProvider client={queryClient}>
+      <ResourceYAMLTab contextName="test-context" kind="Pod" namespace="default" name="api" />
+    </QueryClientProvider>))
+
+    const trigger = button(container, 'Restore')
+    await act(async () => {
+      trigger.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0 }))
+    })
+    expect(mocks.listResourceBackups).toHaveBeenCalledWith('test-context', 'Pod', 'default', 'api')
+    const item = [...document.querySelectorAll('[role="menuitem"]')].find((el) =>
+      el.textContent?.includes('api-pod-2026-10-26_09-30-00.yaml'),
+    ) as HTMLElement
+    expect(item).toBeTruthy()
+    await act(async () => item.click())
+
+    expect(mocks.readResourceBackup).toHaveBeenCalledWith('api-pod-2026-10-26_09-30-00.yaml')
+    expect(container.querySelector('[data-testid="editor"]')?.textContent).toContain('spec: old')
+    expect(container.textContent).toContain('unsaved changes')
+    expect(button(container, 'Review & apply').disabled).toBe(false)
+    expect(mocks.applyResourceYAML).not.toHaveBeenCalled()
+  })
+
+  it('the Search button opens the find bar', async () => {
+    mocks.getResourceYAML.mockResolvedValue('kind: Pod\n')
+    const queryClient = new QueryClient()
+    await act(async () => root.render(<QueryClientProvider client={queryClient}>
+      <ResourceYAMLTab contextName="test-context" kind="Pod" namespace="default" name="api" />
+    </QueryClientProvider>))
+    expect(container.querySelector('input[aria-label="Search YAML"]')).toBeNull()
+    await act(async () => button(container, 'Search').click())
+    expect(container.querySelector('input[aria-label="Search YAML"]')).not.toBeNull()
   })
 })

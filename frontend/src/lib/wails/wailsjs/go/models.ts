@@ -9610,6 +9610,28 @@ export namespace kube {
 	        this.createdAt = source["createdAt"];
 	    }
 	}
+	export class ResourceBackup {
+	    file: string;
+	    context: string;
+	    kind: string;
+	    namespace: string;
+	    name: string;
+	    takenAt: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new ResourceBackup(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.file = source["file"];
+	        this.context = source["context"];
+	        this.kind = source["kind"];
+	        this.namespace = source["namespace"];
+	        this.name = source["name"];
+	        this.takenAt = source["takenAt"];
+	    }
+	}
 	export class ResourceClaimDetail {
 	    name: string;
 	    namespace: string;
