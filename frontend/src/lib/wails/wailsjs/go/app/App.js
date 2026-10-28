@@ -1214,6 +1214,10 @@ export function ListVolumeAttachments(arg1) {
   return window['go']['app']['App']['ListVolumeAttachments'](arg1);
 }
 
+export function MergeKubeconfig(arg1) {
+  return window['go']['app']['App']['MergeKubeconfig'](arg1);
+}
+
 export function OpenInSystemTerminal(arg1, arg2) {
   return window['go']['app']['App']['OpenInSystemTerminal'](arg1, arg2);
 }

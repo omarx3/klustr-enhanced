@@ -109,6 +109,12 @@ func (a *App) DeleteKubeconfigContext(name string) (*kube.DeletedContext, error)
 	return a.clients.DeleteKubeconfigContext(name)
 }
 
+// MergeKubeconfig adds the entries of a pasted kubeconfig to the local
+// kubeconfig, after backing it up.
+func (a *App) MergeKubeconfig(content string) (*kube.MergedKubeconfig, error) {
+	return a.clients.MergeKubeconfig(content)
+}
+
 func (a *App) PingContext(name string) (*kube.ServerVersion, error) {
 	return a.clients.Ping(a.ctx, name)
 }

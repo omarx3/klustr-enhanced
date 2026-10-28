@@ -609,6 +609,8 @@ export function ListValidatingWebhookConfigurations(arg1:string):Promise<Array<k
 
 export function ListVolumeAttachments(arg1:string):Promise<Array<kube.VolumeAttachmentInfo>>;
 
+export function MergeKubeconfig(arg1:string):Promise<kube.MergedKubeconfig>;
+
 export function OpenInSystemTerminal(arg1:string,arg2:string):Promise<void>;
 
 export function OpenLocalTerminal(arg1:string,arg2:number,arg3:number):Promise<string>;

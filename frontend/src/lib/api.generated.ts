@@ -258,6 +258,7 @@ export type LimitRangeInfo = kube.LimitRangeInfo
 export type ListenerSetListenerDetail = kube.ListenerSetListenerDetail
 export type ListenerSetDetail = kube.ListenerSetDetail
 export type ListenerSetInfo = kube.ListenerSetInfo
+export type MergedKubeconfig = kube.MergedKubeconfig
 export type MutationDiff = kube.MutationDiff
 export type NamespaceDetail = kube.NamespaceDetail
 export type NamespaceInfo = kube.NamespaceInfo
@@ -686,6 +687,7 @@ export const generatedApi = {
   listValidatingAdmissionPolicyBindings: bindings.ListValidatingAdmissionPolicyBindings,
   listValidatingWebhookConfigurations: bindings.ListValidatingWebhookConfigurations,
   listVolumeAttachments: bindings.ListVolumeAttachments,
+  mergeKubeconfig: bindings.MergeKubeconfig,
   openInSystemTerminal: bindings.OpenInSystemTerminal,
   openLocalTerminal: bindings.OpenLocalTerminal,
   openPodExecInSystemTerminal: bindings.OpenPodExecInSystemTerminal,

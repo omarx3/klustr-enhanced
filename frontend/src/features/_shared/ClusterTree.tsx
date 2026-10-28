@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type MouseEvent, type Ref } from 'react'
-import { ChevronRight, Columns2, EyeOff, Puzzle, Rows2, Search, Star } from 'lucide-react'
+import { ChevronRight, Columns2, EyeOff, Plus, Puzzle, Rows2, Search, Star } from 'lucide-react'
 
 import {
   ContextMenu,
@@ -9,6 +9,7 @@ import {
   ContextMenuTrigger,
 } from '@/components/ui/context-menu'
 import type { ContextInfo } from '@/lib/api'
+import { AddKubeconfigDialog } from '@/features/contexts/AddKubeconfigDialog'
 import { ContextEntryMenu } from '@/features/contexts/ContextEntryMenu'
 import { sortContextsAlphabetically } from '@/features/contexts/contextSort'
 import { useKubeContexts } from '@/features/contexts/useKubeContexts'
@@ -45,6 +46,7 @@ export function ClusterTree({ activeItemRef }: Props) {
   const expandedClusters = useUIStore((s) => s.expandedClusters)
   const expandClusters = useUIStore((s) => s.expandClusters)
   const [filter, setFilter] = useState('')
+  const [adding, setAdding] = useState(false)
 
   // A cluster that becomes active opens its tree once; collapsing it again
   // sticks until the active set changes.
@@ -86,7 +88,17 @@ export function ClusterTree({ activeItemRef }: Props) {
             {contexts.length}
           </span>
         )}
+        <button
+          type="button"
+          onClick={() => setAdding(true)}
+          title="Add kubeconfig"
+          aria-label="Add kubeconfig"
+          className="ml-0.5 rounded p-0.5 text-muted-foreground hover:bg-sidebar-accent hover:text-foreground"
+        >
+          <Plus className="size-3" aria-hidden />
+        </button>
       </div>
+      {adding && <AddKubeconfigDialog onClose={() => setAdding(false)} />}
       {contexts.length > FILTER_THRESHOLD && (
         <label className="mx-1 mb-1 flex items-center gap-1.5 rounded border border-sidebar-border bg-background/40 px-2 py-1 text-xs focus-within:ring-1 focus-within:ring-ring">
           <Search className="size-3 shrink-0 text-muted-foreground" aria-hidden />

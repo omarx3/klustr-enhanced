@@ -8329,6 +8329,26 @@ export namespace kube {
 	    }
 	}
 	
+	export class MergedKubeconfig {
+	    contexts: string[];
+	    clusters: string[];
+	    users: string[];
+	    file: string;
+	    backup: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new MergedKubeconfig(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.contexts = source["contexts"];
+	        this.clusters = source["clusters"];
+	        this.users = source["users"];
+	        this.file = source["file"];
+	        this.backup = source["backup"];
+	    }
+	}
 	export class MutationDiff {
 	    kind: string;
 	    name: string;
