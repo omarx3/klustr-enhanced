@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useSyncExternalStore } from 'react'
 import { Activity, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
@@ -94,8 +94,25 @@ export function DeploymentMonitorRunner() {
     const id = window.setInterval(() => void checkAll(), MONITOR_INTERVAL_MS)
     return () => window.clearInterval(id)
   }, [count])
+
+  // Separate from the checks so old alerts still expire with no monitors left.
+  // Runs once the saved state has loaded, which also drops alerts that aged
+  // out while the app was closed.
+  const hydrated = useSyncExternalStore(
+    (cb) => useDeploymentMonitors.persist.onFinishHydration(cb),
+    () => useDeploymentMonitors.persist.hasHydrated(),
+  )
+  useEffect(() => {
+    if (!hydrated) return
+    const prune = () => useDeploymentMonitors.getState().pruneAlerts(Date.now())
+    prune()
+    const id = window.setInterval(prune, ALERT_PRUNE_INTERVAL_MS)
+    return () => window.clearInterval(id)
+  }, [hydrated])
   return null
 }
+
+const ALERT_PRUNE_INTERVAL_MS = 30_000
 
 // Overview section: pick a deployment by namespace and list active monitors.
 export function DeploymentMonitorSection({ contextName }: { contextName: string }) {

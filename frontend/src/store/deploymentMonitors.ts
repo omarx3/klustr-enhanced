@@ -70,11 +70,22 @@ export type MonitorAlert = {
 // Older alerts are dropped past this many, so the persisted list stays small.
 export const MAX_ALERTS = 200
 
+// Alerts are dropped once they are older than this.
+export const ALERT_TTL_MS = 20 * 60_000
+
+// Alerts still within ALERT_TTL_MS of now; the same array when none expired,
+// so a no-op prune does not trigger a re-render or a disk write.
+export function freshAlerts(alerts: MonitorAlert[], now: number): MonitorAlert[] {
+  const fresh = alerts.filter((a) => now - a.at < ALERT_TTL_MS)
+  return fresh.length === alerts.length ? alerts : fresh
+}
+
 type State = {
   monitors: MonitoredDeployment[]
   alerts: MonitorAlert[]
   addAlert: (alert: Omit<MonitorAlert, 'id'>) => void
   clearAlerts: (context?: string) => void
+  pruneAlerts: (now: number) => void
   add: (context: string, namespace: string, name: string) => void
   remove: (key: string) => void
   record: (key: string, patch: Partial<Pick<MonitoredDeployment, 'last' | 'lastCheckedAt' | 'error'>>) => void
@@ -126,6 +137,11 @@ export const useDeploymentMonitors = create<State>()(
         set((s) => ({
           alerts: [{ ...alert, id: `${monitorKey(alert)}@${alert.at}` }, ...s.alerts].slice(0, MAX_ALERTS),
         })),
+      pruneAlerts: (now) =>
+        set((s) => {
+          const alerts = freshAlerts(s.alerts, now)
+          return alerts === s.alerts ? s : { alerts }
+        }),
       clearAlerts: (context) =>
         set((s) => ({ alerts: context ? s.alerts.filter((a) => a.context !== context) : [] })),
       add: (context, namespace, name) =>

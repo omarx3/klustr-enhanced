@@ -4,7 +4,7 @@ vi.mock('@/lib/api', () => ({
   api: { loadMonitorState: vi.fn().mockResolvedValue(''), saveMonitorState: vi.fn().mockResolvedValue(undefined) },
 }))
 
-import { diffSnapshots, MAX_ALERTS, monitorKey, useDeploymentMonitors } from './deploymentMonitors'
+import { diffSnapshots, freshAlerts, MAX_ALERTS, monitorKey, useDeploymentMonitors } from './deploymentMonitors'
 
 describe('diffSnapshots', () => {
   const base = { replicas: 3, ready: 3, images: ['nginx:1.25'] }
@@ -60,6 +60,26 @@ describe('useDeploymentMonitors', () => {
     expect(useDeploymentMonitors.getState().alerts.every((a) => a.context === 'b')).toBe(true)
     s.clearAlerts()
     expect(useDeploymentMonitors.getState().alerts).toEqual([])
+  })
+
+  it('prunes alerts older than 20 minutes and keeps newer ones', () => {
+    const now = 100 * 60_000
+    const mk = (minsAgo: number) => ({
+      id: String(minsAgo),
+      context: 'c',
+      namespace: 'n',
+      name: 'web',
+      changes: ['x'],
+      at: now - minsAgo * 60_000,
+    })
+    useDeploymentMonitors.setState({ alerts: [mk(1), mk(19), mk(20), mk(45)] })
+    useDeploymentMonitors.getState().pruneAlerts(now)
+    expect(useDeploymentMonitors.getState().alerts.map((a) => a.id)).toEqual(['1', '19'])
+  })
+
+  it('leaves state untouched when nothing expired', () => {
+    const alerts = [{ id: 'a', context: 'c', namespace: 'n', name: 'w', changes: [], at: 1000 }]
+    expect(freshAlerts(alerts, 2000)).toBe(alerts)
   })
 
   it('adds once, records and removes', () => {
