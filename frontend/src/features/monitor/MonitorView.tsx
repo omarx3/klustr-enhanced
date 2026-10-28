@@ -101,7 +101,11 @@ function ClusterSection({
     <section className="border-b border-border px-6 py-4">
       <div className="mb-3 flex min-w-0 items-center gap-2 text-sm font-medium">
         <BellRing className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-        <ContextName name={context} />
+        {/* Same theme colors as the selected tab, so each cluster is easy to spot. */}
+        <ContextName
+          name={context}
+          className="min-w-0 truncate rounded-md border border-[var(--nav-selected-edge)] bg-gradient-to-r from-[var(--nav-selected)] to-[color-mix(in_oklch,var(--nav-selected)_85%,white)] px-2 py-0.5 font-semibold text-[var(--nav-selected-foreground)] shadow-[0_0_10px_color-mix(in_oklch,var(--nav-selected)_40%,transparent)]"
+        />
         <span className="text-xs font-normal text-muted-foreground">
           {monitors.length} monitored · {alerts.length} alert{alerts.length === 1 ? '' : 's'}
         </span>
