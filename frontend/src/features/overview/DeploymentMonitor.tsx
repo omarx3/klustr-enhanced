@@ -19,7 +19,15 @@ import { DeploymentPicker } from './DeploymentPicker'
 // for the cluster in view, so monitors keep running after a cluster switch.
 async function snapshot(m: MonitoredDeployment): Promise<DeploymentSnapshot> {
   const d = await api.deploymentStatus(m.context, m.namespace, m.name)
-  return { replicas: d.replicas, ready: d.ready, images: d.images ?? [] }
+  return {
+    replicas: d.replicas,
+    ready: d.ready,
+    images: d.images ?? [],
+    exists: d.exists,
+    uid: d.uid,
+    restartedAt: d.restartedAt,
+    podRestarts: d.podRestarts,
+  }
 }
 
 function notify(key: string, title: string, body: string) {
@@ -124,6 +132,8 @@ export function DeploymentMonitorSection({ contextName }: { contextName: string 
                 <span className="min-w-0 flex-1 truncate text-destructive" title={m.error}>
                   {m.error}
                 </span>
+              ) : m.last?.exists === false ? (
+                <span className="min-w-0 flex-1 truncate font-medium text-destructive">Deleted · waiting for it to come back</span>
               ) : m.last ? (
                 <span className="min-w-0 flex-1 truncate text-muted-foreground" title={m.last.images.join(', ')}>
                   {m.last.ready}/{m.last.replicas} ready · {m.last.images.join(', ')}

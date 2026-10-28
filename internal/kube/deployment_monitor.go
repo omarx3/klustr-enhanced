@@ -13,10 +13,24 @@ import (
 
 // DeploymentStatus is what a deployment monitor compares between checks.
 type DeploymentStatus struct {
+	// Exists is false once the deployment is deleted; the other fields are
+	// then zero. A NotFound is a state to report, not an error.
+	Exists bool `json:"exists"`
+	// UID changes when the deployment is deleted and created again between
+	// two checks under the same name.
+	UID      string   `json:"uid"`
 	Replicas int32    `json:"replicas"`
 	Ready    int32    `json:"ready"`
 	Images   []string `json:"images"`
+	// RestartedAt is the timestamp `kubectl rollout restart` (and the Klustr
+	// restart action) stamps on the pod template; empty if never restarted.
+	RestartedAt string `json:"restartedAt"`
+	// PodRestarts sums container restart counts across the deployment's
+	// current pods, so a crash loop shows up as a rising number.
+	PodRestarts int32 `json:"podRestarts"`
 }
+
+const restartedAtAnnotation = "kubectl.kubernetes.io/restartedAt"
 
 // monitorTimeout bounds one check so an unreachable cluster cannot pile up
 // requests across the one-minute interval.
@@ -37,14 +51,36 @@ func deploymentStatus(ctx context.Context, cs kubernetes.Interface, namespace, n
 	ctx, cancel := context.WithTimeout(ctx, monitorTimeout)
 	defer cancel()
 	d, err := cs.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return &DeploymentStatus{Images: []string{}}, nil
+	}
 	if err != nil {
 		return nil, err
 	}
-	return statusOf(d), nil
+	out := statusOf(d)
+	// Pod restarts are a best-effort extra: a user who may read the
+	// deployment but not list pods still gets the other checks.
+	if sel, err := metav1.LabelSelectorAsSelector(d.Spec.Selector); err == nil && !sel.Empty() {
+		pods, err := cs.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: sel.String()})
+		if err == nil {
+			for i := range pods.Items {
+				for _, c := range pods.Items[i].Status.ContainerStatuses {
+					out.PodRestarts += c.RestartCount
+				}
+			}
+		}
+	}
+	return out, nil
 }
 
 func statusOf(d *appsv1.Deployment) *DeploymentStatus {
-	out := &DeploymentStatus{Ready: d.Status.ReadyReplicas, Images: []string{}}
+	out := &DeploymentStatus{
+		Exists:      true,
+		UID:         string(d.UID),
+		Ready:       d.Status.ReadyReplicas,
+		Images:      []string{},
+		RestartedAt: d.Spec.Template.Annotations[restartedAtAnnotation],
+	}
 	// An unset replicas field means the API default of 1.
 	out.Replicas = 1
 	if d.Spec.Replicas != nil {

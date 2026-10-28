@@ -2742,9 +2742,13 @@ export namespace kube {
 	    }
 	}
 	export class DeploymentStatus {
+	    exists: boolean;
+	    uid: string;
 	    replicas: number;
 	    ready: number;
 	    images: string[];
+	    restartedAt: string;
+	    podRestarts: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new DeploymentStatus(source);
@@ -2752,9 +2756,13 @@ export namespace kube {
 	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.exists = source["exists"];
+	        this.uid = source["uid"];
 	        this.replicas = source["replicas"];
 	        this.ready = source["ready"];
 	        this.images = source["images"];
+	        this.restartedAt = source["restartedAt"];
+	        this.podRestarts = source["podRestarts"];
 	    }
 	}
 	export class DeviceSelectorDetail {

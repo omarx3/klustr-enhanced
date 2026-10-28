@@ -193,6 +193,8 @@ function MonitorRow({ monitor: m }: { monitor: MonitoredDeployment }) {
         <span className="min-w-0 flex-1 truncate text-destructive" title={m.error}>
           {m.error}
         </span>
+      ) : m.last?.exists === false ? (
+        <span className="min-w-0 flex-1 truncate font-medium text-destructive">Deleted · waiting for it to come back</span>
       ) : m.last ? (
         <span className="min-w-0 flex-1 truncate text-muted-foreground" title={m.last.images.join(', ')}>
           {m.last.ready}/{m.last.replicas} ready · {m.last.images.join(', ')}

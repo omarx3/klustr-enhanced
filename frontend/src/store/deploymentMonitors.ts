@@ -3,10 +3,16 @@ import { createJSONStorage, persist, type StateStorage } from 'zustand/middlewar
 import { api } from '@/lib/api'
 
 // Snapshot of the fields a deployment monitor compares between checks.
+// The optional fields were added later; a snapshot saved before then lacks
+// them, and comparisons skip a field either side is missing.
 export type DeploymentSnapshot = {
   replicas: number
   ready: number
   images: string[]
+  exists?: boolean
+  uid?: string
+  restartedAt?: string
+  podRestarts?: number
 }
 
 export type MonitoredDeployment = {
@@ -28,7 +34,22 @@ export function monitorKey(m: { context: string; namespace: string; name: string
 // Human-readable list of what changed between two snapshots; empty when
 // nothing did.
 export function diffSnapshots(prev: DeploymentSnapshot, next: DeploymentSnapshot): string[] {
+  const wasThere = prev.exists !== false
+  const isThere = next.exists !== false
+  // Deletion and re-creation replace every other comparison: the pod counts
+  // and images of a deleted deployment are meaningless.
+  if (wasThere && !isThere) return ['deployment deleted']
+  if (!wasThere && isThere) return ['deployment created again']
+  if (!wasThere && !isThere) return []
+  if (prev.uid && next.uid && prev.uid !== next.uid) return ['deployment deleted and created again']
+
   const changes: string[] = []
+  if (prev.restartedAt !== undefined && next.restartedAt !== undefined && prev.restartedAt !== next.restartedAt)
+    changes.push('deployment restarted (rollout restart)')
+  if (prev.podRestarts !== undefined && next.podRestarts !== undefined && next.podRestarts > prev.podRestarts) {
+    const n = next.podRestarts - prev.podRestarts
+    changes.push(`${n} container restart${n === 1 ? '' : 's'}`)
+  }
   if (prev.replicas !== next.replicas) changes.push(`desired pods ${prev.replicas} → ${next.replicas}`)
   if (prev.ready !== next.ready) changes.push(`ready pods ${prev.ready} → ${next.ready}`)
   const a = [...prev.images].sort().join(', ')

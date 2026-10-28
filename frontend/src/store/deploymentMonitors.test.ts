@@ -13,6 +13,29 @@ describe('diffSnapshots', () => {
     expect(diffSnapshots({ ...base, images: ['a', 'b'] }, { ...base, images: ['b', 'a'] })).toEqual([])
   })
 
+  it('reports deletion and re-creation instead of field changes', () => {
+    const live = { ...base, exists: true, uid: 'a', restartedAt: '', podRestarts: 0 }
+    const gone = { replicas: 0, ready: 0, images: [], exists: false, uid: '', restartedAt: '', podRestarts: 0 }
+    expect(diffSnapshots(live, gone)).toEqual(['deployment deleted'])
+    expect(diffSnapshots(gone, gone)).toEqual([])
+    expect(diffSnapshots(gone, live)).toEqual(['deployment created again'])
+    expect(diffSnapshots(live, { ...live, uid: 'b', replicas: 9 })).toEqual(['deployment deleted and created again'])
+  })
+
+  it('reports rollout restarts and new container restarts', () => {
+    const live = { ...base, exists: true, uid: 'a', restartedAt: '', podRestarts: 2 }
+    expect(diffSnapshots(live, { ...live, restartedAt: '2026-10-28T18:00:00Z' })).toEqual([
+      'deployment restarted (rollout restart)',
+    ])
+    expect(diffSnapshots(live, { ...live, podRestarts: 5 })).toEqual(['3 container restarts'])
+    // Pods replaced by a rollout reset their counts; a drop is not an alert.
+    expect(diffSnapshots(live, { ...live, podRestarts: 0 })).toEqual([])
+  })
+
+  it('skips the new checks against a snapshot saved before they existed', () => {
+    expect(diffSnapshots(base, { ...base, exists: true, uid: 'a', restartedAt: 'x', podRestarts: 4 })).toEqual([])
+  })
+
   it('reports pod count and image changes', () => {
     expect(diffSnapshots(base, { replicas: 5, ready: 2, images: ['nginx:1.26'] })).toEqual([
       'desired pods 3 → 5',
