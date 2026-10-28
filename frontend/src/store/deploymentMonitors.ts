@@ -1,5 +1,6 @@
 import { create } from 'zustand'
-import { persist } from 'zustand/middleware'
+import { createJSONStorage, persist, type StateStorage } from 'zustand/middleware'
+import { api } from '@/lib/api'
 
 // Snapshot of the fields a deployment monitor compares between checks.
 export type DeploymentSnapshot = {
@@ -56,6 +57,43 @@ type State = {
   add: (context: string, namespace: string, name: string) => void
   remove: (key: string) => void
   record: (key: string, patch: Partial<Pick<MonitoredDeployment, 'last' | 'lastCheckedAt' | 'error'>>) => void
+  // Monitor the Monitor page scrolls to and highlights, set by clicking an alert.
+  focusedKey: string | null
+  focus: (key: string | null) => void
+}
+
+// Saves to a file through the backend so monitors survive restarts no matter
+// what happens to the webview's storage. localStorage stays as a fallback for
+// the first run after upgrading, and for when the backend is not reachable.
+const monitorFileStorage: StateStorage = {
+  getItem: async (name) => {
+    try {
+      const saved = await api.loadMonitorState()
+      if (saved) return saved
+    } catch {
+      // fall through to localStorage
+    }
+    return localStorage.getItem(name)
+  },
+  setItem: async (name, value) => {
+    // A write before the saved state has loaded would replace it with the
+    // empty initial state and lose every monitor.
+    if (!useDeploymentMonitors.persist.hasHydrated()) return
+    localStorage.setItem(name, value)
+    try {
+      await api.saveMonitorState(value)
+    } catch {
+      // localStorage still holds it
+    }
+  },
+  removeItem: async (name) => {
+    localStorage.removeItem(name)
+    try {
+      await api.saveMonitorState('{}')
+    } catch {
+      // ignore
+    }
+  },
 }
 
 export const useDeploymentMonitors = create<State>()(
@@ -80,7 +118,14 @@ export const useDeploymentMonitors = create<State>()(
       remove: (key) => set((s) => ({ monitors: s.monitors.filter((m) => monitorKey(m) !== key) })),
       record: (key, patch) =>
         set((s) => ({ monitors: s.monitors.map((m) => (monitorKey(m) === key ? { ...m, ...patch } : m)) })),
+      focusedKey: null,
+      focus: (key) => set({ focusedKey: key }),
     }),
-    { name: 'klustr.deploymentMonitors' },
+    {
+      name: 'klustr.deploymentMonitors',
+      storage: createJSONStorage(() => monitorFileStorage),
+      // Only the configuration and history persist; the focus is per session.
+      partialize: (s) => ({ monitors: s.monitors, alerts: s.alerts }),
+    },
   ),
 )

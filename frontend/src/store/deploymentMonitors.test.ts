@@ -1,4 +1,9 @@
-import { describe, expect, it, beforeEach } from 'vitest'
+import { describe, expect, it, beforeEach, vi } from 'vitest'
+
+vi.mock('@/lib/api', () => ({
+  api: { loadMonitorState: vi.fn().mockResolvedValue(''), saveMonitorState: vi.fn().mockResolvedValue(undefined) },
+}))
+
 import { diffSnapshots, MAX_ALERTS, monitorKey, useDeploymentMonitors } from './deploymentMonitors'
 
 describe('diffSnapshots', () => {

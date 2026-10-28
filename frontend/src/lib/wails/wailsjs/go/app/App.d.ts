@@ -613,6 +613,8 @@ export function ListValidatingWebhookConfigurations(arg1:string):Promise<Array<k
 
 export function ListVolumeAttachments(arg1:string):Promise<Array<kube.VolumeAttachmentInfo>>;
 
+export function LoadMonitorState():Promise<string>;
+
 export function MergeKubeconfig(arg1:string):Promise<kube.MergedKubeconfig>;
 
 export function OpenInSystemTerminal(arg1:string,arg2:string):Promise<void>;
@@ -672,6 +674,8 @@ export function RollbackDeployment(arg1:string,arg2:string,arg3:string,arg4:numb
 export function RollbackHelmRelease(arg1:string,arg2:string,arg3:string,arg4:number,arg5:boolean):Promise<void>;
 
 export function RollbackStatefulSet(arg1:string,arg2:string,arg3:string,arg4:number):Promise<void>;
+
+export function SaveMonitorState(arg1:string):Promise<void>;
 
 export function SaveTextFile(arg1:string,arg2:string):Promise<string>;
 

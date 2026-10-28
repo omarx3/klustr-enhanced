@@ -1222,6 +1222,10 @@ export function ListVolumeAttachments(arg1) {
   return window['go']['app']['App']['ListVolumeAttachments'](arg1);
 }
 
+export function LoadMonitorState() {
+  return window['go']['app']['App']['LoadMonitorState']();
+}
+
 export function MergeKubeconfig(arg1) {
   return window['go']['app']['App']['MergeKubeconfig'](arg1);
 }
@@ -1340,6 +1344,10 @@ export function RollbackHelmRelease(arg1, arg2, arg3, arg4, arg5) {
 
 export function RollbackStatefulSet(arg1, arg2, arg3, arg4) {
   return window['go']['app']['App']['RollbackStatefulSet'](arg1, arg2, arg3, arg4);
+}
+
+export function SaveMonitorState(arg1) {
+  return window['go']['app']['App']['SaveMonitorState'](arg1);
 }
 
 export function SaveTextFile(arg1, arg2) {

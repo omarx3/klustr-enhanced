@@ -683,6 +683,16 @@ func (a *App) DeploymentStatus(contextName, namespace, name string) (*kube.Deplo
 	return a.clients.DeploymentStatus(a.ctx, contextName, namespace, name)
 }
 
+// LoadMonitorState and SaveMonitorState keep the deployment monitors on disk
+// so they survive restarts.
+func (a *App) LoadMonitorState() (string, error) {
+	return kube.LoadMonitorState()
+}
+
+func (a *App) SaveMonitorState(state string) error {
+	return kube.SaveMonitorState(state)
+}
+
 // ListDeploymentNames lists deployments straight from the API, so the monitor
 // picker works for a context that is not being watched.
 func (a *App) ListDeploymentNames(contextName string) ([]kube.DeploymentRef, error) {

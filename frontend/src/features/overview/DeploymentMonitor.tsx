@@ -12,6 +12,7 @@ import {
   type DeploymentSnapshot,
   type MonitoredDeployment,
 } from '@/store/deploymentMonitors'
+import { showMonitor } from '@/store/showMonitor'
 import { DeploymentPicker } from './DeploymentPicker'
 
 // Reads the API directly instead of the informer cache, which exists only
@@ -32,6 +33,7 @@ function notify(key: string, title: string, body: string) {
     closeButton: true,
     // Larger than the default toast so a change is hard to miss.
     className: '!w-[28rem] !p-5 !text-sm [&_[data-title]]:!text-base [&_[data-description]]:!text-sm',
+    action: { label: 'View', onClick: () => showMonitor(key) },
   })
   // The webview may not support desktop notifications; the toast is the
   // fallback that always shows.
