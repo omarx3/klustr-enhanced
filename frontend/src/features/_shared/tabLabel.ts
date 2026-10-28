@@ -1,4 +1,4 @@
-import { Puzzle } from 'lucide-react'
+import { BellRing, Puzzle } from 'lucide-react'
 import { ALL_SIDEBAR_GROUPS, type SidebarIcon } from '@/features/_shared/resourceGroups'
 import type { ResourceView, ViewTab } from '@/store/ui'
 
@@ -18,6 +18,8 @@ function buildViewMeta(): Map<ResourceView, TabMeta> {
       out.set(i.view, { label, icon: i.icon })
     }
   }
+  // Opened from the top bar rather than the sidebar.
+  out.set('monitor', { label: 'Monitor', icon: BellRing })
   return out
 }
 

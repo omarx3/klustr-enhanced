@@ -104,6 +104,8 @@ import { TerminalButton } from '@/features/terminal/TerminalButton'
 import { TerminalDrawer } from '@/features/terminal/TerminalDrawer'
 import { Toaster } from '@/components/ui/sonner'
 import { DeploymentMonitorRunner } from '@/features/overview/DeploymentMonitor'
+import { MonitorButton } from '@/features/monitor/MonitorButton'
+import { MonitorView } from '@/features/monitor/MonitorView'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { api } from '@/lib/api'
 import { isEditableTarget, isOverlayOpen, ownsVerticalArrows } from '@/lib/dom'
@@ -177,6 +179,8 @@ function TabView({ view, crdKey: selectedCRDKey }: { view: ResourceView; crdKey:
   switch (view) {
     case 'overview':
       return <OverviewView />
+    case 'monitor':
+      return <MonitorView />
     case 'workloadsoverview':
       return <WorkloadsOverviewView />
     case 'pods':
@@ -598,6 +602,7 @@ function App() {
           </div>
           <div className="flex items-center gap-1">
             {/* Cluster session tools */}
+            <MonitorButton />
             <TerminalButton />
             <PortForwardIndicator />
             <ReadOnlyToggle />

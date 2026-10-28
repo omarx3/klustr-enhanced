@@ -36,8 +36,23 @@ export function diffSnapshots(prev: DeploymentSnapshot, next: DeploymentSnapshot
   return changes
 }
 
+export type MonitorAlert = {
+  id: string
+  context: string
+  namespace: string
+  name: string
+  changes: string[]
+  at: number
+}
+
+// Older alerts are dropped past this many, so the persisted list stays small.
+export const MAX_ALERTS = 200
+
 type State = {
   monitors: MonitoredDeployment[]
+  alerts: MonitorAlert[]
+  addAlert: (alert: Omit<MonitorAlert, 'id'>) => void
+  clearAlerts: (context?: string) => void
   add: (context: string, namespace: string, name: string) => void
   remove: (key: string) => void
   record: (key: string, patch: Partial<Pick<MonitoredDeployment, 'last' | 'lastCheckedAt' | 'error'>>) => void
@@ -47,6 +62,13 @@ export const useDeploymentMonitors = create<State>()(
   persist(
     (set) => ({
       monitors: [],
+      alerts: [],
+      addAlert: (alert) =>
+        set((s) => ({
+          alerts: [{ ...alert, id: `${monitorKey(alert)}@${alert.at}` }, ...s.alerts].slice(0, MAX_ALERTS),
+        })),
+      clearAlerts: (context) =>
+        set((s) => ({ alerts: context ? s.alerts.filter((a) => a.context !== context) : [] })),
       add: (context, namespace, name) =>
         set((s) => {
           const key = monitorKey({ context, namespace, name })

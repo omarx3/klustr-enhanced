@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach } from 'vitest'
-import { diffSnapshots, monitorKey, useDeploymentMonitors } from './deploymentMonitors'
+import { diffSnapshots, MAX_ALERTS, monitorKey, useDeploymentMonitors } from './deploymentMonitors'
 
 describe('diffSnapshots', () => {
   const base = { replicas: 3, ready: 3, images: ['nginx:1.25'] }
@@ -19,6 +19,20 @@ describe('diffSnapshots', () => {
 
 describe('useDeploymentMonitors', () => {
   beforeEach(() => useDeploymentMonitors.setState({ monitors: [] }))
+
+  it('keeps newest alerts first, capped, and clears per context', () => {
+    const s = useDeploymentMonitors.getState()
+    useDeploymentMonitors.setState({ alerts: [] })
+    for (let i = 0; i < MAX_ALERTS + 5; i++)
+      s.addAlert({ context: i % 2 ? 'a' : 'b', namespace: 'ns', name: 'web', changes: ['x'], at: i })
+    const alerts = useDeploymentMonitors.getState().alerts
+    expect(alerts).toHaveLength(MAX_ALERTS)
+    expect(alerts[0].at).toBe(MAX_ALERTS + 4)
+    s.clearAlerts('a')
+    expect(useDeploymentMonitors.getState().alerts.every((a) => a.context === 'b')).toBe(true)
+    s.clearAlerts()
+    expect(useDeploymentMonitors.getState().alerts).toEqual([])
+  })
 
   it('adds once, records and removes', () => {
     const s = useDeploymentMonitors.getState()

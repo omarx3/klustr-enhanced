@@ -70,6 +70,7 @@ export const MAX_TAGS_PER_CONTEXT = 3
 export type ResourceView =
   | IntegrationView
   | 'overview'
+  | 'monitor'
   | 'workloadsoverview'
   | 'pods'
   | 'deployments'
