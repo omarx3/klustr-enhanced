@@ -576,6 +576,7 @@ function App() {
     return (
       <TooltipProvider delayDuration={250}>
         <ConnectionsScreen />
+        <DeploymentMonitorRunner />
         <Toaster position="bottom-right" />
       </TooltipProvider>
     )

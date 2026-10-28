@@ -677,6 +677,18 @@ func (a *App) ListDeployments(name, namespace string) []kube.DeploymentInfo {
 	return a.clients.Deployments(name, namespace)
 }
 
+// DeploymentStatus reads a deployment directly, for monitors on contexts
+// that may not be watched.
+func (a *App) DeploymentStatus(contextName, namespace, name string) (*kube.DeploymentStatus, error) {
+	return a.clients.DeploymentStatus(a.ctx, contextName, namespace, name)
+}
+
+// ListDeploymentNames lists deployments straight from the API, so the monitor
+// picker works for a context that is not being watched.
+func (a *App) ListDeploymentNames(contextName string) ([]kube.DeploymentRef, error) {
+	return a.clients.DeploymentNames(a.ctx, contextName)
+}
+
 func (a *App) ListServices(name, namespace string) []kube.ServiceInfo {
 	return a.clients.Services(name, namespace)
 }

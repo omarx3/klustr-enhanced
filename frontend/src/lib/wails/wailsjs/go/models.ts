@@ -2727,6 +2727,36 @@ export namespace kube {
 	        this.createdAt = source["createdAt"];
 	    }
 	}
+	export class DeploymentRef {
+	    namespace: string;
+	    name: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new DeploymentRef(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.namespace = source["namespace"];
+	        this.name = source["name"];
+	    }
+	}
+	export class DeploymentStatus {
+	    replicas: number;
+	    ready: number;
+	    images: string[];
+	
+	    static createFrom(source: any = {}) {
+	        return new DeploymentStatus(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.replicas = source["replicas"];
+	        this.ready = source["ready"];
+	        this.images = source["images"];
+	    }
+	}
 	export class DeviceSelectorDetail {
 	    expression: string;
 	

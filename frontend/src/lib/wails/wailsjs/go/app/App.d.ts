@@ -37,6 +37,8 @@ export function DeleteResource(arg1:string,arg2:string,arg3:string,arg4:string):
 
 export function DenyCertificateSigningRequest(arg1:string,arg2:string,arg3:string):Promise<void>;
 
+export function DeploymentStatus(arg1:string,arg2:string,arg3:string):Promise<kube.DeploymentStatus>;
+
 export function DrainNode(arg1:string,arg2:string,arg3:boolean):Promise<void>;
 
 export function DryRunApplyResourceYAML(arg1:string,arg2:string):Promise<kube.MutationDiff>;
@@ -376,6 +378,8 @@ export function ListCustomResources(arg1:string,arg2:string,arg3:string,arg4:str
 export function ListDaemonSetRevisions(arg1:string,arg2:string,arg3:string):Promise<Array<kube.WorkloadRevision>>;
 
 export function ListDaemonSets(arg1:string,arg2:string):Promise<Array<kube.DaemonSetInfo>>;
+
+export function ListDeploymentNames(arg1:string):Promise<Array<kube.DeploymentRef>>;
 
 export function ListDeploymentRevisions(arg1:string,arg2:string,arg3:string):Promise<Array<kube.WorkloadRevision>>;
 

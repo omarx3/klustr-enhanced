@@ -2,10 +2,12 @@ import { useMemo } from 'react'
 import { Activity, BellRing, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { ContextName } from '@/features/_shared/ContextName'
+import { useKubeContexts } from '@/features/contexts/useKubeContexts'
+import { DeploymentPicker } from '@/features/overview/DeploymentPicker'
 import { formatAge } from '@/lib/time'
 import { useNowTick } from '@/lib/nowTick'
 import { useDeploymentMonitors, type MonitorAlert } from '@/store/deploymentMonitors'
-import { useActiveContexts, useUIStore } from '@/store/ui'
+import { useActiveContexts } from '@/store/ui'
 
 // Recent deployment monitor alerts, grouped by cluster. Covers every context
 // with monitors or alerts, not only the active ones, since monitors keep
@@ -15,7 +17,12 @@ export function MonitorView() {
   const monitors = useDeploymentMonitors((s) => s.monitors)
   const clearAlerts = useDeploymentMonitors((s) => s.clearAlerts)
   const activeContexts = useActiveContexts()
-  const setSelectedView = useUIStore((s) => s.setSelectedView)
+  const kubeContexts = useKubeContexts()
+  // Active clusters first, as the likeliest pick, then the rest of the kubeconfig.
+  const allContexts = useMemo(() => {
+    const rest = kubeContexts.map((c) => c.name).filter((n) => !activeContexts.includes(n)).sort()
+    return [...activeContexts, ...rest]
+  }, [kubeContexts, activeContexts])
   useNowTick()
 
   const contexts = useMemo(() => {
@@ -38,10 +45,12 @@ export function MonitorView() {
           </span>
         </div>
         <div className="flex items-center gap-2">
-          <Button variant="outline" size="sm" onClick={() => setSelectedView('overview')}>
-            <Activity />
-            Add monitor
-          </Button>
+          <DeploymentPicker contexts={allContexts}>
+            <Button variant="outline" size="sm">
+              <Activity />
+              Add monitor
+            </Button>
+          </DeploymentPicker>
           <Button variant="outline" size="sm" disabled={alerts.length === 0} onClick={() => clearAlerts()}>
             <Trash2 />
             Clear all
@@ -50,7 +59,7 @@ export function MonitorView() {
       </div>
       {contexts.length === 0 && (
         <p className="px-6 py-8 text-center text-xs text-muted-foreground">
-          No deployments monitored. Add one from the cluster Overview.
+          No deployments monitored. Use Add monitor to pick one.
         </p>
       )}
       {contexts.map((ctx) => (

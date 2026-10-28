@@ -97,6 +97,8 @@ export type DebugSession = kube.DebugSession
 export type DeletedContext = kube.DeletedContext
 export type DeploymentDetail = kube.DeploymentDetail
 export type DeploymentInfo = kube.DeploymentInfo
+export type DeploymentRef = kube.DeploymentRef
+export type DeploymentStatus = kube.DeploymentStatus
 export type DeviceSelectorDetail = kube.DeviceSelectorDetail
 export type DeviceClassDetail = kube.DeviceClassDetail
 export type DeviceClassInfo = kube.DeviceClassInfo
@@ -401,6 +403,7 @@ export const generatedApi = {
   deleteKubeconfigContext: bindings.DeleteKubeconfigContext,
   deleteResource: bindings.DeleteResource,
   denyCertificateSigningRequest: bindings.DenyCertificateSigningRequest,
+  deploymentStatus: bindings.DeploymentStatus,
   drainNode: bindings.DrainNode,
   dryRunApplyResourceYAML: bindings.DryRunApplyResourceYAML,
   ensureCustomResourceWatch: bindings.EnsureCustomResourceWatch,
@@ -571,6 +574,7 @@ export const generatedApi = {
   listCustomResources: bindings.ListCustomResources,
   listDaemonSetRevisions: bindings.ListDaemonSetRevisions,
   listDaemonSets: bindings.ListDaemonSets,
+  listDeploymentNames: bindings.ListDeploymentNames,
   listDeploymentRevisions: bindings.ListDeploymentRevisions,
   listDeployments: bindings.ListDeployments,
   listDeviceClasses: bindings.ListDeviceClasses,

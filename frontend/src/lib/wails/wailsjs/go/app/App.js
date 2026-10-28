@@ -70,6 +70,10 @@ export function DenyCertificateSigningRequest(arg1, arg2, arg3) {
   return window['go']['app']['App']['DenyCertificateSigningRequest'](arg1, arg2, arg3);
 }
 
+export function DeploymentStatus(arg1, arg2, arg3) {
+  return window['go']['app']['App']['DeploymentStatus'](arg1, arg2, arg3);
+}
+
 export function DrainNode(arg1, arg2, arg3) {
   return window['go']['app']['App']['DrainNode'](arg1, arg2, arg3);
 }
@@ -748,6 +752,10 @@ export function ListDaemonSetRevisions(arg1, arg2, arg3) {
 
 export function ListDaemonSets(arg1, arg2) {
   return window['go']['app']['App']['ListDaemonSets'](arg1, arg2);
+}
+
+export function ListDeploymentNames(arg1) {
+  return window['go']['app']['App']['ListDeploymentNames'](arg1);
 }
 
 export function ListDeploymentRevisions(arg1, arg2, arg3) {

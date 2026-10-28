@@ -1,17 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useEffect } from 'react'
 import { Activity, X } from 'lucide-react'
 import { toast } from 'sonner'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu'
-import { api, type DeploymentInfo } from '@/lib/api'
+import { api } from '@/lib/api'
 import { formatAge } from '@/lib/time'
 import { useNowTick } from '@/lib/nowTick'
 import {
@@ -22,10 +12,13 @@ import {
   type DeploymentSnapshot,
   type MonitoredDeployment,
 } from '@/store/deploymentMonitors'
+import { DeploymentPicker } from './DeploymentPicker'
 
+// Reads the API directly instead of the informer cache, which exists only
+// for the cluster in view, so monitors keep running after a cluster switch.
 async function snapshot(m: MonitoredDeployment): Promise<DeploymentSnapshot> {
-  const d = await api.getDeployment(m.context, m.namespace, m.name)
-  return { replicas: d.replicas, ready: d.ready, images: (d.containers ?? []).map((c) => c.image) }
+  const d = await api.deploymentStatus(m.context, m.namespace, m.name)
+  return { replicas: d.replicas, ready: d.ready, images: d.images ?? [] }
 }
 
 function notify(key: string, title: string, body: string) {
@@ -97,87 +90,23 @@ export function DeploymentMonitorRunner() {
 // Overview section: pick a deployment by namespace and list active monitors.
 export function DeploymentMonitorSection({ contextName }: { contextName: string }) {
   const allMonitors = useDeploymentMonitors((s) => s.monitors)
-  const add = useDeploymentMonitors((s) => s.add)
   const remove = useDeploymentMonitors((s) => s.remove)
   const monitors = allMonitors.filter((m) => m.context === contextName)
-  const [open, setOpen] = useState(false)
-  const [deployments, setDeployments] = useState<DeploymentInfo[]>([])
   useNowTick()
-
-  useEffect(() => {
-    if (!open) return
-    let cancelled = false
-    let tries = 0
-    // The deployment informer starts on first use, so the first list can be
-    // empty; retry briefly while the menu is open.
-    const load = () => {
-      api
-        .listDeployments(contextName, '')
-        .then((list) => {
-          if (cancelled) return
-          setDeployments(list ?? [])
-          if ((list ?? []).length === 0 && tries++ < 5) window.setTimeout(load, 500)
-        })
-        .catch(() => {})
-    }
-    load()
-    return () => {
-      cancelled = true
-    }
-  }, [open, contextName])
-
-  const byNamespace = new Map<string, string[]>()
-  for (const d of deployments) byNamespace.set(d.namespace, [...(byNamespace.get(d.namespace) ?? []), d.name])
-  const namespaces = [...byNamespace.keys()].sort()
-  const watched = new Set(monitors.map(monitorKey))
 
   return (
     <section className="px-6 py-4">
       <div className="mb-2 flex items-center justify-between">
         <h2 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Deployment monitors</h2>
-        <DropdownMenu open={open} onOpenChange={setOpen}>
-          <DropdownMenuTrigger asChild>
-            <button
-              type="button"
-              className="flex items-center gap-1.5 rounded border border-border px-2 py-1 text-xs hover:bg-accent"
-            >
-              <Activity className="size-3.5" aria-hidden />
-              Monitor deployment
-            </button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="max-h-96 overflow-y-auto">
-            <DropdownMenuLabel className="text-xs">Namespaces</DropdownMenuLabel>
-            {namespaces.length === 0 && (
-              <DropdownMenuItem disabled className="text-xs">
-                No deployments found
-              </DropdownMenuItem>
-            )}
-            {namespaces.map((ns) => (
-              <DropdownMenuSub key={ns}>
-                <DropdownMenuSubTrigger className="text-xs">{ns}</DropdownMenuSubTrigger>
-                <DropdownMenuSubContent className="max-h-80 overflow-y-auto">
-                  {(byNamespace.get(ns) ?? []).sort().map((name) => {
-                    const isWatched = watched.has(monitorKey({ context: contextName, namespace: ns, name }))
-                    return (
-                      <DropdownMenuItem
-                        key={name}
-                        disabled={isWatched}
-                        className="text-xs"
-                        onSelect={() => {
-                          add(contextName, ns, name)
-                          toast.success(`Monitoring ${ns}/${name}`, { description: 'Checked every minute.' })
-                        }}
-                      >
-                        {name}
-                        {isWatched && <span className="ml-auto text-muted-foreground">monitored</span>}
-                      </DropdownMenuItem>
-                    )
-                  })}
-                </DropdownMenuSubContent>
-              </DropdownMenuSub>
-            ))}
-          </DropdownMenuContent>
-        </DropdownMenu>
+        <DeploymentPicker contextName={contextName}>
+          <button
+            type="button"
+            className="flex items-center gap-1.5 rounded border border-border px-2 py-1 text-xs hover:bg-accent"
+          >
+            <Activity className="size-3.5" aria-hidden />
+            Monitor deployment
+          </button>
+        </DeploymentPicker>
       </div>
       {monitors.length === 0 ? (
         <p className="text-xs text-muted-foreground">No deployments monitored.</p>
