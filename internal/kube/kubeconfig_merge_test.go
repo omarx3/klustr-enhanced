@@ -2,6 +2,7 @@ package kube
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -35,15 +36,16 @@ func TestMergeKubeconfigAddsNewEntries(t *testing.T) {
 	path := writeKubeconfig(t, dir, "config", kubeconfigFixture)
 	rules := rulesFor(path)
 
-	out, err := mergeIntoConfig(rules, pastedFixture, time.Unix(0, 0))
+	backups := t.TempDir()
+	out, err := mergeIntoConfig(rules, pastedFixture, backups, time.Unix(0, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Join(out.Contexts, ",") != "staging" || strings.Join(out.Clusters, ",") != "staging-cluster" || strings.Join(out.Users, ",") != "staging-user" {
 		t.Fatalf("unexpected result: %+v", out)
 	}
-	if out.Backup == "" {
-		t.Fatal("expected a backup")
+	if filepath.Dir(out.Backup) != backups {
+		t.Fatalf("backup %q not in %s", out.Backup, backups)
 	}
 	cfg, err := clientcmd.LoadFromFile(path)
 	if err != nil {
@@ -69,7 +71,7 @@ func TestMergeKubeconfigRejectsConflicts(t *testing.T) {
 	before, _ := os.ReadFile(path)
 	pasted := strings.Replace(pastedFixture, "https://shared.example.com", "https://other.example.com", 1)
 
-	if _, err := mergeIntoConfig(rulesFor(path), pasted, time.Unix(0, 0)); err == nil || !strings.Contains(err.Error(), "cluster shared-cluster") {
+	if _, err := mergeIntoConfig(rulesFor(path), pasted, t.TempDir(), time.Unix(0, 0)); err == nil || !strings.Contains(err.Error(), "cluster shared-cluster") {
 		t.Fatalf("expected conflict error, got %v", err)
 	}
 	after, _ := os.ReadFile(path)
@@ -81,7 +83,7 @@ func TestMergeKubeconfigRejectsConflicts(t *testing.T) {
 func TestMergeKubeconfigRejectsBadInput(t *testing.T) {
 	path := writeKubeconfig(t, t.TempDir(), "config", kubeconfigFixture)
 	for _, in := range []string{"", "not: [yaml", "apiVersion: v1\nkind: Config\n", kubeconfigFixture} {
-		if _, err := mergeIntoConfig(rulesFor(path), in, time.Unix(0, 0)); err == nil {
+		if _, err := mergeIntoConfig(rulesFor(path), in, t.TempDir(), time.Unix(0, 0)); err == nil {
 			t.Fatalf("expected error for %q", in)
 		}
 	}
@@ -89,7 +91,7 @@ func TestMergeKubeconfigRejectsBadInput(t *testing.T) {
 
 func TestMergeKubeconfigCreatesMissingFile(t *testing.T) {
 	path := t.TempDir() + "/config"
-	out, err := mergeIntoConfig(rulesFor(path), pastedFixture, time.Unix(0, 0))
+	out, err := mergeIntoConfig(rulesFor(path), pastedFixture, t.TempDir(), time.Unix(0, 0))
 	if err != nil {
 		t.Fatal(err)
 	}

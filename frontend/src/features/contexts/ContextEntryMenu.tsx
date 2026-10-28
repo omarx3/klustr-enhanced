@@ -98,7 +98,7 @@ function DeleteContextDialog({ context, label, onClose }: { context: ContextInfo
                 from your local kubeconfig. Its cluster and user entries are removed too unless another context still
                 uses them. Nothing in the cluster itself is touched.
               </p>
-              <p>A backup of the kubeconfig is saved next to it first.</p>
+              <p>A backup of the kubeconfig is saved to Klustr's config folder first.</p>
             </div>
           </DialogDescription>
         </DialogHeader>
