@@ -114,19 +114,20 @@ export function DeploymentMonitorSection({ contextName }: { contextName: string 
         <ul className="divide-y divide-border rounded border border-border text-xs">
           {monitors.map((m) => (
             <li key={monitorKey(m)} className="flex items-center gap-3 px-3 py-1.5">
-              <span className="min-w-0 flex-1 truncate font-mono">
+              {/* Fixed column so long image names cannot squeeze the deployment name out. */}
+              <span className="w-56 shrink-0 truncate font-mono" title={`${m.namespace}/${m.name}`}>
                 {m.namespace}/{m.name}
               </span>
               {m.error ? (
-                <span className="truncate text-destructive" title={m.error}>
+                <span className="min-w-0 flex-1 truncate text-destructive" title={m.error}>
                   {m.error}
                 </span>
               ) : m.last ? (
-                <span className="text-muted-foreground">
+                <span className="min-w-0 flex-1 truncate text-muted-foreground" title={m.last.images.join(', ')}>
                   {m.last.ready}/{m.last.replicas} ready · {m.last.images.join(', ')}
                 </span>
               ) : (
-                <span className="text-muted-foreground">Checking…</span>
+                <span className="min-w-0 flex-1 text-muted-foreground">Checking…</span>
               )}
               <span className="w-16 text-right text-muted-foreground">
                 {m.lastCheckedAt ? formatAge(new Date(m.lastCheckedAt).toISOString()) : ''}
