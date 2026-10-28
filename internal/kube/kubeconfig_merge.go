@@ -36,7 +36,11 @@ func (m *ClientManager) MergeKubeconfig(content string) (*MergedKubeconfig, erro
 	// See DeleteKubeconfigContext: ModifyConfig rewrites whole files.
 	rules.DoNotResolvePaths = true
 
-	out, err := mergeIntoConfig(&rules, content, time.Now())
+	backupDir, err := kubeconfigBackupDir()
+	if err != nil {
+		return nil, err
+	}
+	out, err := mergeIntoConfig(&rules, content, backupDir, time.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -44,7 +48,7 @@ func (m *ClientManager) MergeKubeconfig(content string) (*MergedKubeconfig, erro
 	return out, nil
 }
 
-func mergeIntoConfig(access clientcmd.ConfigAccess, content string, now time.Time) (*MergedKubeconfig, error) {
+func mergeIntoConfig(access clientcmd.ConfigAccess, content, backupDir string, now time.Time) (*MergedKubeconfig, error) {
 	if strings.TrimSpace(content) == "" {
 		return nil, fmt.Errorf("the pasted kubeconfig is empty")
 	}
@@ -121,7 +125,7 @@ func mergeIntoConfig(access clientcmd.ConfigAccess, content string, now time.Tim
 	sort.Strings(out.Users)
 
 	if _, err := os.Stat(file); err == nil {
-		backup, err := backupFile(file, now.Format("20060102-150405"))
+		backup, err := backupFile(file, backupDir, now.Format("20060102-150405"))
 		if err != nil {
 			return nil, fmt.Errorf("backing up %s: %w", file, err)
 		}

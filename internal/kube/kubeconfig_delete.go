@@ -38,7 +38,11 @@ func (m *ClientManager) DeleteKubeconfigContext(contextName string) (*DeletedCon
 	// certificate paths.
 	rules.DoNotResolvePaths = true
 
-	out, err := deleteContextFromConfig(&rules, contextName, time.Now())
+	backupDir, err := kubeconfigBackupDir()
+	if err != nil {
+		return nil, err
+	}
+	out, err := deleteContextFromConfig(&rules, contextName, backupDir, time.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -54,7 +58,7 @@ func (m *ClientManager) DeleteKubeconfigContext(contextName string) (*DeletedCon
 	return out, nil
 }
 
-func deleteContextFromConfig(access clientcmd.ConfigAccess, contextName string, now time.Time) (*DeletedContext, error) {
+func deleteContextFromConfig(access clientcmd.ConfigAccess, contextName, backupDir string, now time.Time) (*DeletedContext, error) {
 	if contextName == "" {
 		return nil, fmt.Errorf("no context name given")
 	}
@@ -95,7 +99,7 @@ func deleteContextFromConfig(access clientcmd.ConfigAccess, contextName string, 
 
 	stamp := now.Format("20060102-150405")
 	for f := range files {
-		backup, err := backupFile(f, stamp)
+		backup, err := backupFile(f, backupDir, stamp)
 		if err != nil {
 			return nil, fmt.Errorf("backing up %s: %w", f, err)
 		}
@@ -115,9 +119,19 @@ func originOf(location string, access clientcmd.ConfigAccess) string {
 	return location
 }
 
-// backupFile copies path to "<path>.klustr-backup-<stamp>" with the same
-// permissions, since a kubeconfig holds credentials.
-func backupFile(path, stamp string) (string, error) {
+// kubeconfigBackupDir is where kubeconfig backups go: Klustr's own config
+// directory (~/.config/klustr on Linux), so they do not pile up in ~/.kube.
+func kubeconfigBackupDir() (string, error) {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "klustr"), nil
+}
+
+// backupFile copies path to "<dir>/<name>.klustr-backup-<stamp>" with the
+// same permissions, since a kubeconfig holds credentials.
+func backupFile(path, dir, stamp string) (string, error) {
 	src, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -127,10 +141,24 @@ func backupFile(path, stamp string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	dst := fmt.Sprintf("%s.klustr-backup-%s", path, stamp)
-	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
-	if err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
+	}
+	// KUBECONFIG can list several files with the same name in different
+	// directories; all their backups land in one directory, so a taken name
+	// gets a counter instead of failing the whole change.
+	base := filepath.Join(dir, fmt.Sprintf("%s.klustr-backup-%s", filepath.Base(path), stamp))
+	dst := base
+	var f *os.File
+	for i := 2; ; i++ {
+		f, err = os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
+		if err == nil {
+			break
+		}
+		if !os.IsExist(err) || i > 100 {
+			return "", err
+		}
+		dst = fmt.Sprintf("%s-%d", base, i)
 	}
 	if _, err := io.Copy(f, src); err != nil {
 		_ = f.Close()
