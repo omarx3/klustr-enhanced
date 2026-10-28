@@ -27,6 +27,7 @@ import { formatAge } from '@/lib/time'
 import { useNowTick } from '@/lib/nowTick'
 import { useActiveContexts, useContextLabel, useIsAggregated, useUIStore } from '@/store/ui'
 import { ContextName } from '@/features/_shared/ContextName'
+import { DeploymentMonitorSection } from './DeploymentMonitor'
 import { RunningNowSection } from './RunningNowSection'
 
 const POLL_INTERVAL_MS = 15_000
@@ -383,6 +384,7 @@ function ClusterSection({
         </div>
       </div>
 
+      <DeploymentMonitorSection contextName={contextName} />
       {runningNow}
       {showWarnings && (
         <WarningsSection

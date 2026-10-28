@@ -103,6 +103,7 @@ import { PortForwardIndicator } from '@/features/portforward/PortForwardIndicato
 import { TerminalButton } from '@/features/terminal/TerminalButton'
 import { TerminalDrawer } from '@/features/terminal/TerminalDrawer'
 import { Toaster } from '@/components/ui/sonner'
+import { DeploymentMonitorRunner } from '@/features/overview/DeploymentMonitor'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { api } from '@/lib/api'
 import { isEditableTarget, isOverlayOpen, ownsVerticalArrows } from '@/lib/dom'
@@ -714,6 +715,7 @@ function App() {
         <CommandPalette />
         <NamespaceSearchPalette />
         <PodSearchPalette />
+        <DeploymentMonitorRunner />
         <Toaster position="bottom-right" />
       </div>
     </TooltipProvider>
