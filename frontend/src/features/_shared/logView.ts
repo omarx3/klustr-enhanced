@@ -1,5 +1,5 @@
 import { clipColumns, columnWidth } from './logColumns'
-import { highlightLogContent } from './logHighlight'
+import { highlightLogContent, highlightMatches } from './logHighlight'
 
 // A retained log line. text is what the filter matches and Save writes, body is
 // the line as the container printed it, and prefix is pre-styled and stays
@@ -20,7 +20,7 @@ export type LogMarker = { marker: string }
 
 export type LogEntry = LogLine | LogMarker
 
-export type LogLayout = { wrap: boolean; offset: number; cols: number }
+export type LogLayout = { wrap: boolean; offset: number; cols: number; match?: RegExp | null }
 
 export function isMarker(entry: LogEntry): entry is LogMarker {
   return 'marker' in entry
@@ -50,8 +50,9 @@ export function pickVisible(
 export function renderEntry(entry: LogEntry, layout: LogLayout): string {
   if (isMarker(entry)) return layout.wrap ? entry.marker : clipColumns(entry.marker, 0, layout.cols)
   entry.styled ??= highlightLogContent(entry.body)
-  if (layout.wrap) return entry.prefix + entry.styled
+  const styled = layout.match ? highlightMatches(entry.styled, layout.match) : entry.styled
+  if (layout.wrap) return entry.prefix + styled
   const room = layout.cols - entry.prefixWidth
   if (room <= 0) return clipColumns(entry.prefix, 0, layout.cols)
-  return entry.prefix + clipColumns(entry.styled, layout.offset, room)
+  return entry.prefix + clipColumns(styled, layout.offset, room)
 }

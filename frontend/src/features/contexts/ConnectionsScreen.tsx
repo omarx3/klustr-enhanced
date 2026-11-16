@@ -19,6 +19,7 @@ import {
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Spinner } from '@/components/ui/spinner'
+import { AddKubeconfigDialog } from '@/features/contexts/AddKubeconfigDialog'
 import {
   Dialog,
   DialogContent,
@@ -100,6 +101,7 @@ export function ConnectionsScreen() {
   const [reloadKey, setReloadKey] = useState(0)
   const [picked, setPicked] = useState<Set<string>>(() => new Set())
   const [editing, setEditing] = useState<ContextGroup | null>(null)
+  const [addingKubeconfig, setAddingKubeconfig] = useState(false)
   const [mappingTarget, setMappingTarget] = useState<ContextInfo | null>(null)
   const setCredStatuses = useCredentialsStore((s) => s.setStatuses)
 
@@ -441,6 +443,16 @@ export function ConnectionsScreen() {
               <Plus />
               New group
             </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setAddingKubeconfig(true)}
+              title="Merge a kubeconfig into your local kubeconfig"
+            >
+              <Plus />
+              Add kubeconfig
+            </Button>
+            {addingKubeconfig && <AddKubeconfigDialog onClose={() => setAddingKubeconfig(false)} />}
             <Button
               variant="outline"
               size="sm"

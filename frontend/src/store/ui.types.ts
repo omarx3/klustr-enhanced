@@ -266,5 +266,6 @@ export type PendingAction =
   | { kind: 'portforward'; resource: SelectedResource }
   | { kind: 'service-portforward'; resource: SelectedResource }
   | { kind: 'restart'; resource: SelectedResource }
+  | { kind: 'trigger'; resource: SelectedResource }
   | { kind: 'scale'; resource: SelectedResource }
   | { kind: 'duplicate'; resource: SelectedResource }

@@ -108,3 +108,60 @@ export function highlightLogContent(line: string): string {
   }
   return out
 }
+
+const MATCH_ON = '\x1b[30;43m'
+const MATCH_OFF = '\x1b[39;49m'
+// eslint-disable-next-line no-control-regex -- matching terminal escapes is the point
+const CSI = /\x1b\[[0-9;:?]*[ -/]*[@-~]/y
+
+// Marks every match of re (which must carry the g flag) in an already styled
+// line. Matching runs on the visible text so escapes never split a match;
+// after a match the styling active since the last reset is replayed, and
+// inside one it is re-applied after any escape that could clear it.
+export function highlightMatches(styled: string, re: RegExp): string {
+  let visible = ''
+  for (let i = 0; i < styled.length; ) {
+    CSI.lastIndex = i
+    if (CSI.test(styled)) i = CSI.lastIndex
+    else visible += styled[i++]
+  }
+  const ranges: Array<[number, number]> = []
+  for (const m of visible.matchAll(re)) if (m[0]) ranges.push([m.index, m.index + m[0].length])
+  if (ranges.length === 0) return styled
+
+  let out = ''
+  let sgr = ''
+  let v = 0
+  let r = 0
+  for (let i = 0; i < styled.length; ) {
+    CSI.lastIndex = i
+    if (CSI.test(styled)) {
+      const esc = styled.slice(i, CSI.lastIndex)
+      i = CSI.lastIndex
+      out += esc
+      if (!esc.endsWith('m')) continue
+      sgr = esc === '\x1b[0m' || esc === '\x1b[m' ? '' : sgr + esc
+      if (r < ranges.length && v > ranges[r][0]) out += MATCH_ON
+      continue
+    }
+    if (r < ranges.length && v === ranges[r][0]) out += MATCH_ON
+    out += styled[i++]
+    v++
+    if (r < ranges.length && v === ranges[r][1]) {
+      out += MATCH_OFF + sgr
+      r++
+    }
+  }
+  return out
+}
+
+// The search box as a highlight pattern: the regex itself, or the plain text
+// matched literally. Both ignore case, like the filter.
+export function searchPattern(filter: string, regex: boolean): RegExp | null {
+  if (!filter) return null
+  try {
+    return new RegExp(regex ? filter : filter.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi')
+  } catch {
+    return null
+  }
+}

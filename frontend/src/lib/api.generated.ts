@@ -750,6 +750,7 @@ export const generatedApi = {
   syncArgoApplication: bindings.SyncArgoApplication,
   tektonPipelineRunsForPipeline: bindings.TektonPipelineRunsForPipeline,
   tektonRunState: bindings.TektonRunState,
+  triggerCronJob: bindings.TriggerCronJob,
   uninstallHelmRelease: bindings.UninstallHelmRelease,
   updateHelmRepos: bindings.UpdateHelmRepos,
   upgradeHelmRelease: bindings.UpgradeHelmRelease,

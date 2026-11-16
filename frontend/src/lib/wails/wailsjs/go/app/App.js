@@ -1458,6 +1458,10 @@ export function TektonRunState(arg1, arg2, arg3, arg4) {
   return window['go']['app']['App']['TektonRunState'](arg1, arg2, arg3, arg4);
 }
 
+export function TriggerCronJob(arg1, arg2, arg3) {
+  return window['go']['app']['App']['TriggerCronJob'](arg1, arg2, arg3);
+}
+
 export function UninstallHelmRelease(arg1, arg2, arg3, arg4) {
   return window['go']['app']['App']['UninstallHelmRelease'](arg1, arg2, arg3, arg4);
 }

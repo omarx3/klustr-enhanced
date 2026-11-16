@@ -25,6 +25,8 @@ type Options = {
   scrollback: number
   retain: number
   predicate: (text: string) => boolean
+  // Marks the search matches in each shown line.
+  highlight?: RegExp | null
 }
 
 // useLogTerminal owns a read-only xterm log view: the retained lines, pause,
@@ -32,7 +34,7 @@ type Options = {
 // entries, repainted whenever what it should show changes. Unwrapped, each line
 // is exactly one row cut to the visible columns, so sideways scrolling is a
 // repaint at a new column offset.
-export function useLogTerminal({ scrollback, retain, predicate }: Options) {
+export function useLogTerminal({ scrollback, retain, predicate, highlight = null }: Options) {
   const themeId = useUIStore((s) => s.themeId)
   const wrap = useUIStore((s) => s.logWrap)
   const hostRef = useRef<HTMLDivElement>(null)
@@ -41,6 +43,7 @@ export function useLogTerminal({ scrollback, retain, predicate }: Options) {
   const fitRef = useRef<FitAddon | null>(null)
   const entriesRef = useRef<LogEntry[]>([])
   const predicateRef = useRef(predicate)
+  const highlightRef = useRef(highlight)
   const wrapRef = useRef(wrap)
   const pausedRef = useRef(false)
   // Entries that arrived while paused sit at the end of entriesRef; repaints
@@ -74,7 +77,7 @@ export function useLogTerminal({ scrollback, retain, predicate }: Options) {
       setExtent(widest)
     }
     setCols(term.cols)
-    const layout = { wrap: !unwrapped, offset: offsetRef.current, cols: term.cols }
+    const layout = { wrap: !unwrapped, offset: offsetRef.current, cols: term.cols, match: highlightRef.current }
     const rows = shown.map((entry) => renderEntry(entry, layout))
     const buf = term.buffer.active
     const fromBottom = keepScroll ? buf.baseY - buf.viewportY : 0
@@ -200,8 +203,9 @@ export function useLogTerminal({ scrollback, retain, predicate }: Options) {
 
   useEffect(() => {
     predicateRef.current = predicate
+    highlightRef.current = highlight
     requestPaint()
-  }, [predicate, requestPaint])
+  }, [predicate, highlight, requestPaint])
 
   useEffect(() => {
     wrapRef.current = wrap
@@ -213,7 +217,7 @@ export function useLogTerminal({ scrollback, retain, predicate }: Options) {
     (lines: LogLine[]) => {
       const term = termRef.current
       if (!term) return
-      const layout = { wrap: wrapRef.current, offset: offsetRef.current, cols: term.cols }
+      const layout = { wrap: wrapRef.current, offset: offsetRef.current, cols: term.cols, match: highlightRef.current }
       const out: string[] = []
       let held = 0
       let widest = extentRef.current

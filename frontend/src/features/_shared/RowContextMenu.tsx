@@ -1,4 +1,4 @@
-import { Copy, CopyPlus, FileCode2, FileText, Network, RotateCcw, ScanEye, ScrollText, Sliders, Square, Terminal, Trash2 } from 'lucide-react'
+import { Copy, CopyPlus, FileCode2, FileText, Network, Play, RotateCcw, ScanEye, ScrollText, Sliders, Square, Terminal, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { usePortForwards } from '@/store/portForwards'
@@ -166,6 +166,12 @@ export function RowContextMenu({
           <ContextMenuItem onSelect={() => setPendingAction({ kind: 'restart', resource })}>
             <RotateCcw />
             <span>Rolling restart</span>
+          </ContextMenuItem>
+        )}
+        {!readOnly && kind === 'CronJob' && (
+          <ContextMenuItem onSelect={() => setPendingAction({ kind: 'trigger', resource })}>
+            <Play />
+            <span>Trigger</span>
           </ContextMenuItem>
         )}
         {!readOnly && isScalableKind && (

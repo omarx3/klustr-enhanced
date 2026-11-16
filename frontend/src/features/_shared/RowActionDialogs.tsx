@@ -1,5 +1,6 @@
 import { DeleteResourceDialog } from './DeleteResourceButton'
 import { RestartWorkloadDialog } from './RestartWorkloadButton'
+import { TriggerCronJobDialog } from '@/features/cronjobs/TriggerCronJobButton'
 import { DeleteArgoApplicationDialog } from '@/features/argocd/DeleteArgoApplicationButton'
 import { isArgoApplication } from '@/features/argocd/argoApplication'
 import { PortForwardDialog } from '@/features/portforward/PortForwardButton'
@@ -70,6 +71,17 @@ export function RowActionDialogs() {
   if (pendingAction.kind === 'restart') {
     return (
       <RestartWorkloadDialog
+        contextName={contextName}
+        resource={pendingAction.resource}
+        open
+        onOpenChange={onOpenChange}
+      />
+    )
+  }
+
+  if (pendingAction.kind === 'trigger') {
+    return (
+      <TriggerCronJobDialog
         contextName={contextName}
         resource={pendingAction.resource}
         open

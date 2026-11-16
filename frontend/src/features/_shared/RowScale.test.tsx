@@ -134,3 +134,18 @@ describe('row menu Scale', () => {
     expect(document.querySelector<HTMLInputElement>('#scale-replicas-input')!.value).toBe('1')
   })
 })
+
+describe('row menu Trigger', () => {
+  it('is offered for a CronJob and opens the trigger dialog', async () => {
+    render('CronJob')
+    expect(await openMenu()).toContain('Trigger')
+    act(() => menuItem('Trigger').click())
+    await flush()
+    expect(document.body.textContent).toContain('Trigger CronJob?')
+  })
+
+  it('is not offered for a Job', async () => {
+    render('Job')
+    expect(await openMenu()).not.toContain('Trigger')
+  })
+})

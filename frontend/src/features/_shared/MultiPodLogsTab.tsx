@@ -9,6 +9,7 @@ import { LogViewport } from '@/features/_shared/LogViewport'
 import { LogToolbar } from '@/features/_shared/LogToolbar'
 import type { LogLine } from '@/features/_shared/logView'
 import { useLogTerminal } from '@/features/_shared/useLogTerminal'
+import { searchPattern } from '@/features/_shared/logHighlight'
 import { useUIStore } from '@/store/ui'
 
 const TAIL_LINES = 50
@@ -76,8 +77,9 @@ export function MultiPodLogsTab({ contextName, namespace, selector, title }: Pro
     return { predicate: (line: string) => line.toLowerCase().includes(needle), error: null }
   }, [filterValue, useRegex])
   const filterError = appliedPredicate.error
+  const highlight = useMemo(() => searchPattern(filterValue, useRegex), [filterValue, useRegex])
 
-  const view = useLogTerminal({ scrollback: 20_000, retain: RETAIN_CAP, predicate: appliedPredicate.predicate })
+  const view = useLogTerminal({ scrollback: 20_000, retain: RETAIN_CAP, predicate: appliedPredicate.predicate, highlight })
   const { append, appendMarker, reset } = view
 
   useEffect(() => {

@@ -385,6 +385,10 @@ func (a *App) RestartWorkload(contextName, kind, namespace, name string) error {
 	return a.clients.RestartWorkload(a.ctx, contextName, kind, namespace, name)
 }
 
+func (a *App) TriggerCronJob(contextName, namespace, name string) (string, error) {
+	return a.clients.TriggerCronJob(a.ctx, contextName, namespace, name)
+}
+
 func (a *App) StartPortForward(contextName, namespace, podName string, localPort, remotePort int) (kube.PortForwardInfo, error) {
 	// localPort 0 means "auto-assign an ephemeral port"; remotePort is a real
 	// container port. Reject out-of-range values instead of letting the uint16

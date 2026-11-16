@@ -68,6 +68,7 @@ import { EndpointsDetailBody } from '@/features/endpoints/EndpointsDetailBody'
 import { ReplicationControllerDetailBody } from '@/features/replicationcontrollers/ReplicationControllerDetailBody'
 import { JobDetailBody } from '@/features/jobs/JobDetailBody'
 import { CronJobDetailBody } from '@/features/cronjobs/CronJobDetailBody'
+import { TriggerCronJobButton } from '@/features/cronjobs/TriggerCronJobButton'
 import { ServiceDetailBody } from '@/features/services/ServiceDetailBody'
 import { ConfigMapDetailBody } from '@/features/configmaps/ConfigMapDetailBody'
 import { SecretDetailBody } from '@/features/secrets/SecretDetailBody'
@@ -301,6 +302,9 @@ function ResourceDetailPanelInner({ contextName, resource, expanded, canSplit, o
               )}
               {!readOnly && isRestartable(resource.kind) && (
                 <RestartWorkloadButton contextName={contextName} resource={resource} />
+              )}
+              {!readOnly && resource.kind === 'CronJob' && !resource.gvr && (
+                <TriggerCronJobButton contextName={contextName} resource={resource} />
               )}
               {!readOnly && isScalable(resource.kind) && (
                 <ScaleResourceButton contextName={contextName} resource={resource} managers={managers} />

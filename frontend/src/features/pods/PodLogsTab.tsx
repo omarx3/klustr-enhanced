@@ -9,6 +9,7 @@ import { LogViewport } from '@/features/_shared/LogViewport'
 import { LogToolbar } from '@/features/_shared/LogToolbar'
 import type { LogLine } from '@/features/_shared/logView'
 import { useLogTerminal } from '@/features/_shared/useLogTerminal'
+import { searchPattern } from '@/features/_shared/logHighlight'
 import { useUIStore } from '@/store/ui'
 
 // How far back a stream starts; 0 asks for the whole log. Scrolling still
@@ -101,8 +102,9 @@ export function PodLogsTab({ detail, contextName, initialContainer, containerReq
     return { predicate: (line: string) => line.toLowerCase().includes(needle), error: null }
   }, [appliedFilter, useRegex])
   const filterError = appliedPredicate.error
+  const highlight = useMemo(() => searchPattern(appliedFilter, useRegex), [appliedFilter, useRegex])
 
-  const view = useLogTerminal({ scrollback: 10_000, retain: 50_000, predicate: appliedPredicate.predicate })
+  const view = useLogTerminal({ scrollback: 10_000, retain: 50_000, predicate: appliedPredicate.predicate, highlight })
   const { append, appendMarker, reset, refit } = view
 
   useEffect(() => {

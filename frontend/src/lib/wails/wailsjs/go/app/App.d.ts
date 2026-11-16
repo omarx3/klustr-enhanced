@@ -731,6 +731,8 @@ export function TektonPipelineRunsForPipeline(arg1:string,arg2:string,arg3:strin
 
 export function TektonRunState(arg1:string,arg2:string,arg3:string,arg4:string):Promise<string>;
 
+export function TriggerCronJob(arg1:string,arg2:string,arg3:string):Promise<string>;
+
 export function UninstallHelmRelease(arg1:string,arg2:string,arg3:string,arg4:boolean):Promise<void>;
 
 export function UpdateHelmRepos():Promise<void>;
