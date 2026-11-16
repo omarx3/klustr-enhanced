@@ -201,6 +201,55 @@ wails dev        # hot-reload dev session
 wails build -trimpath -clean
 ```
 
+### Local .deb (Linux, amd64)
+
+1. One-time setup:
+
+   ```bash
+   sudo apt install build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev jq
+   mise trust && mise install              # Go, Node and the Wails CLI from the repo's mise config
+   eval "$(mise env -s bash)"              # put those tools on PATH in this shell
+   go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.46.3   # same nfpm version the release workflow uses
+   ```
+
+   `go install` puts nfpm in `~/go/bin`; make sure that is on `PATH`.
+
+2. Build the app binary with the release workflow's flags:
+
+   ```bash
+   BASE=0.92.1
+   SHA=$(git rev-parse --short HEAD)
+   VERSION="$BASE+local.$SHA"
+   cp wails.json /tmp/wails.json.orig
+   jq --arg v "$BASE" '.info.productVersion = $v' wails.json > wails.json.tmp && mv wails.json.tmp wails.json
+   wails build -tags webkit2_41 -platform linux/amd64 -ldflags "-X klustr/app.Version=v$VERSION" -trimpath -clean
+   cp /tmp/wails.json.orig wails.json      # put the placeholder version back
+   ```
+
+   This creates `build/bin/klustr`. The `jq` step only sets the version shown inside the app, and the last line undoes it so `wails.json` stays unchanged.
+
+3. Make the .deb from the repo's `build/linux/nfpm.yaml`:
+
+   ```bash
+   VERSION="$VERSION" nfpm package --config build/linux/nfpm.yaml --packager deb \
+     --target "build/bin/klustr_${VERSION}_amd64.deb"
+   ```
+
+4. Check it (optional):
+
+   ```bash
+   dpkg-deb --info build/bin/klustr_*_amd64.deb
+   dpkg-deb --contents build/bin/klustr_*_amd64.deb
+   docker run --rm -v "$PWD/build/bin":/pkg:ro ubuntu:24.04 bash -c \
+     'apt-get update -qq && apt-get install -y /pkg/klustr_*_amd64.deb && dpkg -s klustr'
+   ```
+
+5. Install it:
+
+   ```bash
+   sudo apt install -f ./build/bin/klustr_*_amd64.deb
+   ```
+
 ## Architecture (short version)
 
 | Layer | Choice |
